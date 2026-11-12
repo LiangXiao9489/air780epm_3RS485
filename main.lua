@@ -6,6 +6,9 @@ pm.ioVol(pm.IOVOL_ALL_GPIO, 3300)
 
 log.info("=========== 当前模组的固件版本是 [" .. VERSION .. "] =========")
 
+-- 外部硬件看门狗（Air153C，WTDOG=GPIO28）：require 即启动喂狗 task
+require "ext_wdt"
+
 -- 4G 蜂窝网络管理：SIM 通道 / SIM/IP 状态 / DNS / ICCID
 require "net_4g"
 
