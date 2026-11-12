@@ -12,5 +12,9 @@ require "net_4g"
 -- 网络看门狗：5 分钟无网络活动自动重启（默认未启用，需要时取消注释）
 -- require "net_watchdog"
 
+-- Modbus 网关：主站轮询 u1（下行采集）+ 从站响应 u2（上行透传/写穿透）
+require "master"
+require "slave"
+
 sys.run()
 
