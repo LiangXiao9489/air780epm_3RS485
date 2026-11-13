@@ -7,14 +7,15 @@
 1. require 即启动：读点表 → 初始化缓存 → 开始轮询循环
 2. 按 (dev_id, reg_type, s_addr) 排序后，把同一设备同一类型的连续 s_addr 合并成一次请求
 3. 用 core.encode_request 组帧 → user_485.u1_send 发送 → wait_response 等响应
-4. 用 core.decode_response 解帧 → shared.write_by_a 更新缓存
+4. 用 core.decode_response 解帧 → store.write_by_a 更新缓存
 5. 缓存更新后，上行从站（u2）立刻能读到新值
 ]]
 
-local uart485 = require "hardware"
-local core    = require "core"
-local shared  = require "shared"
-local pt      = require "point_table"
+local uart485         = require "hardware"
+local core            = require "core"
+local store           = require "store"
+local downlink_lock   = require "downlink_uart_lock"
+local pt              = require "point_table"
 
 -- ============================================================
 -- 配置
@@ -98,20 +99,20 @@ local function poll_block(block)
     end
 
     -- 获取 u1 互斥锁（写穿透可能正在用 u1，等它用完）
-    if not shared.lock("master_poll") then
+    if not downlink_lock.lock("master_poll") then
         log.warn("master", "获取 u1 锁超时，跳过 dev=" .. block.dev_id)
         return false
     end
 
     uart485.u1_send(adu)
     local resp_adu, code = uart485.u1_wait_response(RESPONSE_TIMEOUT_MS)
-    shared.unlock()
+    downlink_lock.unlock()
 
     if not resp_adu then
         log.warn("master", "无响应 dev=" .. block.dev_id .. " fc=" .. block.fc,
                  "qty=" .. qty)
         for _, r in ipairs(block.regs) do
-            shared.write_by_a(r.dev_id, r.s_addr, 0xFFFF, core.EXCEPTION_GATEWAY_TARGET_FAILED)
+            store.write_by_a(r.dev_id, r.s_addr, 0xFFFF, core.EXCEPTION_GATEWAY_TARGET_FAILED)
         end
         return false
     end
@@ -121,7 +122,7 @@ local function poll_block(block)
         log.warn("master", "decode_response 失败 dev=" .. block.dev_id,
                  "内部错误码=0x" .. string.format("%02X", err))
         for _, r in ipairs(block.regs) do
-            shared.write_by_a(r.dev_id, r.s_addr, 0xFFFF, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
+            store.write_by_a(r.dev_id, r.s_addr, 0xFFFF, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
         end
         return false
     end
@@ -131,7 +132,7 @@ local function poll_block(block)
                  "fc=0x" .. string.format("%02X", block.fc),
                  "异常码=0x" .. string.format("%02X", resp.exception_code))
         for _, r in ipairs(block.regs) do
-            shared.write_by_a(r.dev_id, r.s_addr, 0xFFFF, resp.exception_code)
+            store.write_by_a(r.dev_id, r.s_addr, 0xFFFF, resp.exception_code)
         end
         return false
     end
@@ -141,9 +142,9 @@ local function poll_block(block)
         if raw == nil then
             log.warn("master", "响应缺值 dev=" .. block.dev_id,
                      "s_addr=" .. reg.s_addr .. " 期望第" .. i .. "个值")
-            shared.write_by_a(reg.dev_id, reg.s_addr, 0xFFFF, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
+            store.write_by_a(reg.dev_id, reg.s_addr, 0xFFFF, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
         else
-            shared.write_by_a(reg.dev_id, reg.s_addr, raw, 0)
+            store.write_by_a(reg.dev_id, reg.s_addr, raw, 0)
         end
     end
 
@@ -159,7 +160,7 @@ end
 -- 主循环
 -- ============================================================
 sys.taskInit(function()
-    if not shared.init(pt) then
+    if not store.init(pt) then
         log.error("master", "缓存初始化失败，主站停止")
         return
     end
@@ -176,7 +177,7 @@ sys.taskInit(function()
     while true do
         round = round + 1
 
-        local all_regs = shared.get_all_regs()
+        local all_regs = store.get_all_regs()
         local blocks = build_poll_blocks(all_regs)
 
         log.info("master", "第 " .. round .. " 轮开始", "块数=" .. #blocks)
@@ -187,7 +188,7 @@ sys.taskInit(function()
         for _, block in ipairs(blocks) do
             -- 有上行写穿透在等 u1 时，先让出总线
             local wait_tick = 0
-            while shared.has_waiter() and wait_tick < 200 do
+            while downlink_lock.has_waiter() and wait_tick < 200 do
                 sys.wait(10)
                 wait_tick = wait_tick + 10
             end

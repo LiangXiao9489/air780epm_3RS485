@@ -16,10 +16,11 @@
 8. 不支持的功能码直接返回 0x01（非法功能码）
 ]]
 
-local uart485 = require "hardware"
-local core    = require "core"
-local shared  = require "shared"
-local pt      = require "point_table"
+local uart485         = require "hardware"
+local core            = require "core"
+local store           = require "store"
+local downlink_lock   = require "downlink_uart_lock"
+local pt              = require "point_table"
 
 -- ============================================================
 -- 配置
@@ -59,7 +60,7 @@ local function handle_read(req)
 
     for i = 0, req.qty - 1 do
         local n_addr = req.addr + i
-        local slot_data, slot_err = shared.read_by_b(req.dev_id, n_addr)
+        local slot_data, slot_err = store.read_by_b(req.dev_id, n_addr)
 
         if slot_data == nil and slot_err == 0x02 then
             return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_ILLEGAL_DATA_ADDRESS)
@@ -93,7 +94,7 @@ end
 local function handle_write_single(req)
     local n_addr = req.addr
 
-    local reg = shared.get_reg_by_b(req.dev_id, n_addr)
+    local reg = store.get_reg_by_b(req.dev_id, n_addr)
     if not reg then
         log.warn("slave", "写 非法 dev_id+n_addr=0x" .. string.format("%02X", req.dev_id)
                  .. "." .. n_addr)
@@ -123,18 +124,18 @@ local function handle_write_single(req)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_ILLEGAL_DATA_VALUE)
     end
 
-    if not shared.lock("slave_write_06") then
+    if not downlink_lock.lock("slave_write_06") then
         log.warn("slave", "写穿透 获取 u1 锁超时")
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_GATEWAY_TARGET_FAILED)
     end
 
     uart485.u1_send(adu)
     local resp_adu, code = uart485.u1_wait_response(WRITE_TIMEOUT)
-    shared.unlock()
+    downlink_lock.unlock()
 
     if not resp_adu then
         log.warn("slave", "写穿透 超时 dev=" .. reg.dev_id .. " s_addr=" .. reg.s_addr)
-        shared.write_by_a(reg.dev_id, reg.s_addr, req.value, core.EXCEPTION_GATEWAY_TARGET_FAILED)
+        store.write_by_a(reg.dev_id, reg.s_addr, req.value, core.EXCEPTION_GATEWAY_TARGET_FAILED)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_GATEWAY_TARGET_FAILED)
     end
 
@@ -142,18 +143,18 @@ local function handle_write_single(req)
     if not resp then
         log.warn("slave", "写穿透 解帧失败 dev=" .. reg.dev_id ..
                  " s_addr=" .. reg.s_addr .. " 内部错误=0x" .. string.format("%02X", err))
-        shared.write_by_a(reg.dev_id, reg.s_addr, req.value, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
+        store.write_by_a(reg.dev_id, reg.s_addr, req.value, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
     end
 
     if resp.is_exception then
         log.warn("slave", "写穿透 从机异常 dev=" .. reg.dev_id ..
                  " s_addr=" .. reg.s_addr .. " ec=0x" .. string.format("%02X", resp.exception_code))
-        shared.write_by_a(reg.dev_id, reg.s_addr, req.value, resp.exception_code)
+        store.write_by_a(reg.dev_id, reg.s_addr, req.value, resp.exception_code)
         return core.encode_exception(req.dev_id, req.fc, resp.exception_code)
     end
 
-    shared.write_by_a(reg.dev_id, reg.s_addr, req.value, 0)
+    store.write_by_a(reg.dev_id, reg.s_addr, req.value, 0)
     log.info("slave", "写穿透成功",
              "B.dev=" .. req.dev_id .. ".n_addr=" .. n_addr ..
              "→ A.dev=" .. reg.dev_id .. ".s_addr=" .. reg.s_addr,
@@ -173,7 +174,7 @@ end
 local function handle_write_single_coil(req)
     local n_addr = req.addr
 
-    local reg = shared.get_reg_by_b(req.dev_id, n_addr)
+    local reg = store.get_reg_by_b(req.dev_id, n_addr)
     if not reg then
         log.warn("slave", "写线圈 非法 dev_id+n_addr=0x" .. string.format("%02X", req.dev_id)
                  .. "." .. n_addr)
@@ -198,18 +199,18 @@ local function handle_write_single_coil(req)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_ILLEGAL_DATA_VALUE)
     end
 
-    if not shared.lock("slave_write_05") then
+    if not downlink_lock.lock("slave_write_05") then
         log.warn("slave", "写线圈 获取 u1 锁超时")
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_GATEWAY_TARGET_FAILED)
     end
 
     uart485.u1_send(adu)
     local resp_adu = uart485.u1_wait_response(WRITE_TIMEOUT)
-    shared.unlock()
+    downlink_lock.unlock()
 
     if not resp_adu then
         log.warn("slave", "写线圈 超时 dev=" .. reg.dev_id .. " s_addr=" .. reg.s_addr)
-        shared.write_by_a(reg.dev_id, reg.s_addr, coil_val, core.EXCEPTION_GATEWAY_TARGET_FAILED)
+        store.write_by_a(reg.dev_id, reg.s_addr, coil_val, core.EXCEPTION_GATEWAY_TARGET_FAILED)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_GATEWAY_TARGET_FAILED)
     end
 
@@ -217,18 +218,18 @@ local function handle_write_single_coil(req)
     if not resp then
         log.warn("slave", "写线圈 解帧失败 dev=" .. reg.dev_id .. " s_addr=" .. reg.s_addr ..
                  " 内部错误=0x" .. string.format("%02X", err))
-        shared.write_by_a(reg.dev_id, reg.s_addr, coil_val, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
+        store.write_by_a(reg.dev_id, reg.s_addr, coil_val, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_SLAVE_DEVICE_FAILURE)
     end
 
     if resp.is_exception then
         log.warn("slave", "写线圈 从机异常 dev=" .. reg.dev_id .. " s_addr=" .. reg.s_addr ..
                  " ec=0x" .. string.format("%02X", resp.exception_code))
-        shared.write_by_a(reg.dev_id, reg.s_addr, coil_val, resp.exception_code)
+        store.write_by_a(reg.dev_id, reg.s_addr, coil_val, resp.exception_code)
         return core.encode_exception(req.dev_id, req.fc, resp.exception_code)
     end
 
-    shared.write_by_a(reg.dev_id, reg.s_addr, coil_val, 0)
+    store.write_by_a(reg.dev_id, reg.s_addr, coil_val, 0)
     log.info("slave", "写线圈成功",
              "B.dev=" .. req.dev_id .. ".n_addr=" .. n_addr ..
              "→ A.dev=" .. reg.dev_id .. ".s_addr=" .. reg.s_addr,
@@ -250,7 +251,7 @@ local function handle_write_multiple_coils(req)
     local regs = {}
 
     for i = 0, req.qty - 1 do
-        local reg = shared.get_reg_by_b(req.dev_id, req.addr + i)
+        local reg = store.get_reg_by_b(req.dev_id, req.addr + i)
         if not reg then
             first_err = core.EXCEPTION_ILLEGAL_DATA_ADDRESS
             break
@@ -293,14 +294,14 @@ local function handle_write_multiple_coils(req)
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_ILLEGAL_DATA_VALUE)
     end
 
-    if not shared.lock("slave_write_0f") then
+    if not downlink_lock.lock("slave_write_0f") then
         log.warn("slave", "写线圈(多) 获取 u1 锁超时")
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_GATEWAY_TARGET_FAILED)
     end
 
     uart485.u1_send(adu)
     local resp_adu = uart485.u1_wait_response(WRITE_TIMEOUT)
-    shared.unlock()
+    downlink_lock.unlock()
 
     if not resp_adu then
         log.warn("slave", "写线圈(多) 超时 dev=" .. regs[1].dev_id ..
@@ -320,7 +321,7 @@ local function handle_write_multiple_coils(req)
     end
 
     for i = 1, req.qty do
-        shared.write_by_a(regs[i].dev_id, regs[i].s_addr,
+        store.write_by_a(regs[i].dev_id, regs[i].s_addr,
                          (values[i] and values[i] ~= 0) and 1 or 0, 0)
     end
 
@@ -341,7 +342,7 @@ local function handle_write_multiple(req)
     local regs = {}
     for i = 0, req.qty - 1 do
         local n_addr = req.addr + i
-        local reg = shared.get_reg_by_b(req.dev_id, n_addr)
+        local reg = store.get_reg_by_b(req.dev_id, n_addr)
 
         if not reg then
             log.warn("slave", "写穿透(多) 校验失败 错误码=0x02",
@@ -386,7 +387,7 @@ local function handle_write_multiple(req)
         end
     end
 
-    if not shared.lock("slave_write_10") then
+    if not downlink_lock.lock("slave_write_10") then
         log.warn("slave", "写穿透(多) 获取 u1 锁超时")
         return core.encode_exception(req.dev_id, req.fc, core.EXCEPTION_GATEWAY_TARGET_FAILED)
     end
@@ -428,7 +429,7 @@ local function handle_write_multiple(req)
             end
 
             for k, reg in ipairs(grp.regs) do
-                shared.write_by_a(reg.dev_id, reg.s_addr, grp.values[k], 0)
+                store.write_by_a(reg.dev_id, reg.s_addr, grp.values[k], 0)
             end
         else
             local reg = grp.regs[1]
@@ -461,11 +462,11 @@ local function handle_write_multiple(req)
                 break
             end
 
-            shared.write_by_a(reg.dev_id, reg.s_addr, grp.values[1], 0)
+            store.write_by_a(reg.dev_id, reg.s_addr, grp.values[1], 0)
         end
     end
 
-    shared.unlock()
+    downlink_lock.unlock()
 
     if first_err then
         log.warn("slave", "写穿透(多) 失败 错误码=0x" .. string.format("%02X", first_err),
@@ -490,7 +491,7 @@ end
 sys.taskInit(function()
     sys.wait(3000)
 
-    while shared.get_all_regs() == nil or #shared.get_all_regs() == 0 do
+    while store.get_all_regs() == nil or #store.get_all_regs() == 0 do
         sys.wait(500)
     end
 

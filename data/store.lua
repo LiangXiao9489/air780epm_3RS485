@@ -1,21 +1,30 @@
 --[[
-@module  shared
-@summary Modbus 网关共享资源：寄存器缓存 + u1 总线互斥锁
+@module  store
+@summary 寄存器缓存层（整个网关共享的数据中枢）
 @version 1.0
-@date    2026.11.12
+@date    2026.11.13
 @usage
-本文件聚合了主站（master）和从站（slave）共享的两部分：
+本模块负责"热泵寄存器缓存"的全生命周期管理。
 
-一、寄存器缓存（RAM 存储，双向索引，多从机支持）
-   每个 slot 同时存 A 侧 (dev_id, s_addr) 和 B 侧 (dev_id, n_addr)
-   - cache_a[dev_id][s_addr] = slot   — 主站轮询更新用
-   - cache_b[dev_id][n_addr] = slot   — 上行从站读取用
-   对外 API：init / write_by_a / read_by_a / read_by_b / get_reg_by_b
-            / get_all_regs / get_regs_by_dev / get_point_values
+所有对热泵寄存器的读写（主站轮询更新、从站响应上位机、未来 MQTT 读写穿透）
+都经过这里，是整个网关唯一的数据源。
 
-二、u1 串口互斥锁
-   确保一次只有一个活跃的 u1 Modbus 事务（主站轮询 / 从站写穿透）
-   对外 API：lock / unlock / has_waiter
+每个 slot 同时存 A 侧 (dev_id, s_addr) 和 B 侧 (dev_id, n_addr)：
+  - cache_a[dev_id][s_addr] = slot   — 主站轮询更新用
+  - cache_b[dev_id][n_addr] = slot   — 上行从站读取用
+
+对外 API：
+  init(pt)                           启动时由 master 调用，展开点表建 slot
+  write_by_a(dev_id, s_addr, data, err)  主站轮询成功后写缓存
+  read_by_b(dev_id, n_addr)          从站读缓存（返回 data, errcode）
+  read_by_a(dev_id, s_addr)          按 A 侧地址读（内部调试用）
+  get_reg_by_b(dev_id, n_addr)       从站查完整点表配置
+  get_all_regs()                     拿到展开后的完整 reg 表（主站轮询用）
+  get_regs_by_dev(dev_id)            按从机地址分组取 regs
+  has_n_addr(dev_id, n_addr)         判断 B 侧地址是否存在
+  get_point_values()                 调试用：按点位聚合所有缓存值
+
+持久化：纯 RAM 存储，重启后由 master 重新轮询热泵填充。
 ]]
 
 local _M = {}
@@ -26,7 +35,7 @@ local _M = {}
 _M.ERR_UNINIT = 0x08   -- 未初始化（未采集过）
 
 -- ============================================================
--- 一、寄存器缓存
+-- 缓存状态
 -- ============================================================
 local cache_a = {}        -- cache_a[dev_id][s_addr] = slot
 local cache_b = {}        -- cache_b[dev_id][n_addr] = slot
@@ -49,7 +58,7 @@ function _M.init(pt)
     local slave_dev = pt.meta.slave_dev or {}
     local regs_tpl = pt.regs or {}
 
-    log.info("shared", "开始初始化", "从机数=" .. #slave_dev, "模板寄存器数=" .. #regs_tpl)
+    log.info("store", "开始初始化", "从机数=" .. #slave_dev, "模板寄存器数=" .. #regs_tpl)
 
     for _, dev_id in ipairs(slave_dev) do
         cache_a[dev_id] = {}
@@ -62,13 +71,13 @@ function _M.init(pt)
 
             -- 校验：reg_count 至少为 1
             if type(count) ~= "number" or count < 1 then
-                log.error("shared", "点表错误", "dev_id="..dev_id,
+                log.error("store", "点表错误", "dev_id="..dev_id,
                           "tag="..tostring(tpl.tag), "reg_count 非法="..tostring(tpl.reg_count))
                 return false
             end
             -- 位类型（线圈/离散）不支持多点
             if (reg_type == 1 or reg_type == 2) and count > 1 then
-                log.error("shared", "点表错误", "dev_id="..dev_id,
+                log.error("store", "点表错误", "dev_id="..dev_id,
                           "tag="..tostring(tpl.tag), "线圈/离散输入不支持 reg_count>1")
                 return false
             end
@@ -76,12 +85,12 @@ function _M.init(pt)
             -- 校验：区间不重叠
             for i = 0, count - 1 do
                 if cache_a[dev_id][tpl.s_addr + i] then
-                    log.error("shared", "点表错误", "dev_id="..dev_id,
+                    log.error("store", "点表错误", "dev_id="..dev_id,
                               "s_addr="..(tpl.s_addr + i).." 重复或区间重叠")
                     return false
                 end
                 if cache_b[dev_id][tpl.n_addr + i] then
-                    log.error("shared", "点表错误", "dev_id="..dev_id,
+                    log.error("store", "点表错误", "dev_id="..dev_id,
                               "n_addr="..(tpl.n_addr + i).." 重复或区间重叠")
                     return false
                 end
@@ -130,7 +139,7 @@ function _M.init(pt)
         end
     end
 
-    log.info("shared", "初始化完成",
+    log.info("store", "初始化完成",
              "总slot数=" .. #expanded_regs,
              "cache_a_devs=" .. #cache_a,
              "cache_b_devs=" .. #cache_b)
@@ -141,7 +150,7 @@ end
 function _M.write_by_a(dev_id, s_addr, data, err)
     local slot = cache_a[dev_id] and cache_a[dev_id][s_addr]
     if not slot then
-        log.warn("shared", "write_by_a",
+        log.warn("store", "write_by_a",
                  "dev_id=" .. tostring(dev_id),
                  "s_addr=" .. tostring(s_addr),
                  "slot不存在")
@@ -232,60 +241,6 @@ function _M.get_point_values()
     end
 
     return result
-end
-
--- ============================================================
--- 二、u1 串口互斥锁
--- ============================================================
-local u1_locked = false
-local lock_owner = nil
-local waiter_count = 0
-local LOCK_EVENT = "MODBUS_U1_UNLOCKED"
-local LOCK_TIMEOUT_MS = 800
-
--- 获取锁；owner 仅日志用
-function _M.lock(owner)
-    local t0 = mcu.ticks()
-    local counted = false
-    if u1_locked then
-        waiter_count = waiter_count + 1
-        counted = true
-    end
-    while u1_locked do
-        local remain = LOCK_TIMEOUT_MS - (mcu.ticks() - t0)
-        if remain <= 0 then
-            if counted then
-                waiter_count = waiter_count - 1
-            end
-            log.warn("shared.mutex", "超时等锁",
-                     "当前持有者=" .. tostring(lock_owner),
-                     "请求者=" .. tostring(owner))
-            return false
-        end
-        sys.waitUntil(LOCK_EVENT, remain)
-    end
-    if counted then
-        waiter_count = waiter_count - 1
-    end
-    u1_locked = true
-    lock_owner = owner
-    return true
-end
-
--- 是否有协程正在等 u1（主站轮询据此让出总线给写穿透）
-function _M.has_waiter()
-    return waiter_count > 0
-end
-
--- 释放锁
-function _M.unlock()
-    if not u1_locked then
-        log.warn("shared.mutex", "unlock 时未上锁")
-        return
-    end
-    u1_locked = false
-    lock_owner = nil
-    sys.publish(LOCK_EVENT)
 end
 
 return _M
