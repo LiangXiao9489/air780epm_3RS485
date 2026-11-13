@@ -8,6 +8,11 @@ log.info("=========== 当前模组的固件版本是 [" .. VERSION .. "] =======
 log.info("=========== 芯片 UID [" .. mcu.unique_id():toHex() .. "] =========")
 
 
+-- ============================================================
+-- 运行时配置（JSON 文件持久化）：必须最先加载，hardware.lua init 串口时要读
+-- ============================================================
+local config = require "config"
+log.info("config", "运行时参数快照", json.encode(config.all()))
 
 -- 外部硬件看门狗（Air153C，WTDOG=GPIO28）：require 即启动喂狗 task
 require "ext_wdt"

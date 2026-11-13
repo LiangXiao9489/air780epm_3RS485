@@ -13,11 +13,20 @@
 -- ============================================================
 -- 配置区：u1（RS485_1，EN 软件翻转）
 -- ============================================================
+local config = require "config"
+
+-- parity 字符串 → uart 常量映射（config 里存 "N"/"E"/"O"，uart.setup 要常量）
+local PARITY_MAP = {
+    N = uart.NONE,
+    E = uart.EVEN,
+    O = uart.ODD,
+}
+
 local u1_uartid      = 1
-local u1_baudrate    = 9600      -- 波特率
-local u1_databits    = 8         -- 数据位
-local u1_stopbits    = 2         -- 停止位
-local u1_parity      = uart.NONE -- 校验位：uart.NONE / uart.ODD / uart.EVEN
+local u1_baudrate    = config.get("u1_baudrate") or 9600
+local u1_databits    = config.get("u1_databits") or 8
+local u1_stopbits    = config.get("u1_stopbits") or 2
+local u1_parity      = PARITY_MAP[config.get("u1_parity") or "N"] or uart.NONE
 local u1_order       = uart.LSB  -- 位序
 local u1_buf_size    = 1024      -- 接收缓冲区大小
 local u1_en_pin      = 25        -- 方向控制脚（TODO 按实物接线确认）
@@ -28,10 +37,10 @@ local u1_rs485_delay = 20000     -- 发送→接收切换延时（微秒），96
 -- 配置区：u2（RS485_2，EN 硬件自动翻转）
 -- ============================================================
 local u2_uartid      = 2
-local u2_baudrate    = 9600
-local u2_databits    = 8
-local u2_stopbits    = 1
-local u2_parity      = uart.NONE
+local u2_baudrate    = config.get("u2_baudrate") or 9600
+local u2_databits    = config.get("u2_databits") or 8
+local u2_stopbits    = config.get("u2_stopbits") or 1
+local u2_parity      = PARITY_MAP[config.get("u2_parity") or "N"] or uart.NONE
 local u2_order       = uart.LSB
 local u2_buf_size    = 1024
 local u2_en_pin      = nil       -- 硬件自动翻转，必须留空
