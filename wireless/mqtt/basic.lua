@@ -32,25 +32,23 @@ local sender = require "sender"
 -- ============================================================
 -- 部署参数：按现场写死
 -- ============================================================
-local SERVER_ADDR   = "114.251.165.201"
-local SERVER_PORT   = 39116
+local SERVER_ADDR   = "broker.emqx.io"
+local SERVER_PORT   = 1883
 local USERNAME      = "" --"mqtt"
 local PASSWORD      = "" --"ZHNY@[mqtt]"
 local CLEAN_SESSION = true
 
--- 无卡/模组未注册时 imei() 可能返回 nil 或空串，用固定值兜底，避免多个设备挤到同一个 topic
-local IMEI = (mobile and mobile.imei()) or ""
-if IMEI == "" then
-    IMEI = "DEV0001"
-end
-local CLIENT_ID = "mqtt_" .. IMEI
+-- 测试模组uid为[ 03230619179356C9 ]
+-- 用芯片 UID 做 MQTT 身份：不依赖 SIM/网络，每颗模组天然唯一
+local UID = mcu.unique_id():toHex()
+local CLIENT_ID = "YEDtest_D700Tm_mqtt_" .. UID
 
 -- 上行主题：当前 1 个。以后要多个，直接用各自的 topic 调 sender.publish 即可，
 -- 本文件不用改（sender 按调用方传入的 topic 发送）。
-local TOPIC_UP = "feiyiPub/" .. IMEI
+local TOPIC_UP = "YEDtest/D700Tm/Pub/" .. UID
 
 -- 下行主题：当前 1 个。以后要多个，往下面 SUB_TOPICS 里加一行。
-local TOPIC_DOWN = "feiyiSub/" .. IMEI
+local TOPIC_DOWN = "YEDtest/D700Tm/Sub/" .. UID
 
 -- 订阅表：[topic] = qos，支持多主题
 local SUB_TOPICS = {
@@ -136,6 +134,18 @@ local function mqtt_client_main_task_func()
             sys.waitUntil("IP_READY", 1000)
         end
         log.info("mqtt.main", "recv IP_READY", socket.dft())
+
+        -- 部署参数集中打印（上电后首次建链前输出一次，现场排查用）
+        log.info("mqtt.main", "======= 部署参数 =======")
+        log.info("mqtt.main", "SERVER       =", SERVER_ADDR .. ":" .. SERVER_PORT)
+        log.info("mqtt.main", "UID          =", UID)
+        log.info("mqtt.main", "CLIENT_ID    =", CLIENT_ID)
+        log.info("mqtt.main", "TOPIC_UP     =", TOPIC_UP)
+        log.info("mqtt.main", "TOPIC_DOWN   =", TOPIC_DOWN)
+        log.info("mqtt.main", "USERNAME     =", USERNAME == "" and "(空)" or USERNAME)
+        log.info("mqtt.main", "PASSWORD     =", PASSWORD == "" and "(空)" or PASSWORD:gsub(".", "*"))
+        log.info("mqtt.main", "CLEAN_SESSION=", CLEAN_SESSION, "KEEPALIVE=", KEEPALIVE_SEC .. "s")
+        log.info("mqtt.main", "========================")
 
         -- 丢弃上一轮残留事件（例如 close 之后才到达的 DISCONNECTED）
         sys.cleanMsg(TASK_NAME)

@@ -5,6 +5,9 @@ VERSION = "666888"
 pm.ioVol(pm.IOVOL_ALL_GPIO, 3300)
 
 log.info("=========== 当前模组的固件版本是 [" .. VERSION .. "] =========")
+log.info("=========== 芯片 UID [" .. mcu.unique_id():toHex() .. "] =========")
+
+
 
 -- 外部硬件看门狗（Air153C，WTDOG=GPIO28）：require 即启动喂狗 task
 require "ext_wdt"
@@ -18,6 +21,9 @@ require "net_4g"
 -- Modbus 网关：主站轮询 u1（下行采集）+ 从站响应 u2（上行透传/写穿透）
 require "master"
 require "slave"
+
+-- MQTT 客户端：建链 / 订阅 / 上下行收发（wireless/mqtt/）
+require "basic"
 
 sys.run()
 
