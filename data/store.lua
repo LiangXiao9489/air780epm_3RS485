@@ -40,6 +40,7 @@ _M.ERR_UNINIT = 0x08   -- 未初始化（未采集过）
 local cache_a = {}        -- cache_a[dev_id][s_addr] = slot
 local cache_b = {}        -- cache_b[dev_id][n_addr] = slot
 local regs_by_b = {}      -- regs_by_b[dev_id][n_addr] = 完整 reg 配置
+local regs_by_tag = {}    -- regs_by_tag[dev_id][tag] = 完整 reg 配置（MQTT 用，tag 是字符串）
 local expanded_regs = {}  -- 展开后的完整点表（给主站轮询用）
 
 -- 判断 (dev_id, n_addr) 是否在 cache_b 里
@@ -53,6 +54,7 @@ function _M.init(pt)
     cache_a = {}
     cache_b = {}
     regs_by_b = {}
+    regs_by_tag = {}
     expanded_regs = {}
 
     local slave_dev = pt.meta.slave_dev or {}
@@ -135,6 +137,13 @@ function _M.init(pt)
                 }
                 regs_by_b[dev_id][n_addr] = full_reg
                 expanded_regs[#expanded_regs + 1] = full_reg
+
+                -- tag 索引：每个点（group_offset==0）建一个 tag → reg 映射
+                -- MQTT 协议按 tag 读写，需要这个索引从 tag 反查到 s_addr
+                if i == 0 then
+                    regs_by_tag[dev_id] = regs_by_tag[dev_id] or {}
+                    regs_by_tag[dev_id][tpl.tag] = full_reg
+                end
             end
         end
     end
@@ -241,6 +250,28 @@ function _M.get_point_values()
     end
 
     return result
+end
+
+-- ============================================================
+-- MQTT 专用：按 tag 查 reg / 读缓存值
+-- MQTT 协议用字符串 tag 标识点位，需要从 tag 反查到 reg 配置
+-- ============================================================
+
+-- 按 (dev_id, tag) 查完整 reg 配置（含 s_addr / reg_type / rw / reg_count）
+function _M.get_reg_by_tag(dev_id, tag)
+    if not regs_by_tag[dev_id] then return nil end
+    return regs_by_tag[dev_id][tag]
+end
+
+-- 按 (dev_id, tag) 读缓存值
+-- 返回: data, errcode
+-- 多寄存器点位（reg_count>1）只返回首寄存器值，MQTT call 协议暂不支持多寄存器按 tag 读
+function _M.read_by_tag(dev_id, tag)
+    local reg = _M.get_reg_by_tag(dev_id, tag)
+    if not reg then
+        return nil, _M.ERR_UNINIT
+    end
+    return _M.read_by_b(dev_id, reg.n_addr)
 end
 
 return _M
