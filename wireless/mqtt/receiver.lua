@@ -16,6 +16,7 @@
 ]]
 
 local receiver = {}
+local down     = require "down"
 
 receiver.TASK_NAME = "mqtt_receiver"
 
@@ -67,12 +68,16 @@ local function recv_task_func()
         while #recv_queue > 0 do
             local item = table.remove(recv_queue, 1)
             local text = tostring(item.payload or "")
+            local topic = tostring(item.topic)
 
-            -- TODO 协议确定后在这里处理：
-            --   local ok, msg = pcall(json.decode, text)
-            --   按 msg.cmd 分发，需要回执时用 sender.publish(topic, json.encode(ack), qos)
-            -- 当前协议未定，先打印代替解析
-            log_payload(tostring(item.topic), text)
+            -- 先打印原始 payload（分段，避免超长截断）
+            log_payload(topic, text)
+
+            -- 交给 protocol/down 解析 + 按 topic/type 分发
+            local ok = down.dispatch(topic, text)
+            if not ok then
+                log.warn("mqtt.recv", "dispatch 未处理", "topic=", topic)
+            end
         end
     end
 end

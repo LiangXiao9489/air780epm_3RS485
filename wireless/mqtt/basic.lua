@@ -28,6 +28,8 @@
 local receiver = require "receiver"
 -- 上行发送模块（自带发送 task + 队列）
 local sender = require "sender"
+-- 协议层：正式 topic 模板（带 SN 的 /s/${sn}、/scr/${sn} 等）
+local topics = require "topics"
 
 -- ============================================================
 -- 部署参数：按现场写死
@@ -43,17 +45,16 @@ local CLEAN_SESSION = true
 local UID = mcu.unique_id():toHex()
 local CLIENT_ID = "YEDtest_D700Tm_mqtt_" .. UID
 
--- 上行主题：当前 1 个。以后要多个，直接用各自的 topic 调 sender.publish 即可，
--- 本文件不用改（sender 按调用方传入的 topic 发送）。
-local TOPIC_UP = "YEDtest/D700Tm/Pub/" .. UID
-
--- 下行主题：当前 1 个。以后要多个，往下面 SUB_TOPICS 里加一行。
-local TOPIC_DOWN = "YEDtest/D700Tm/Sub/" .. UID
-
--- 订阅表：[topic] = qos，支持多主题
+-- 订阅表：同时订阅测试 topic 和协议正式 topic，两边都能下行
+-- 正式 topic 格式由 protocol/topics.lua 统一管理，以后 basic.lua 全部接过去
 local SUB_TOPICS = {
-    [TOPIC_DOWN] = 0,
+    -- 测试 topic（当前 broker.emqx.io 订阅的）
+    ["YEDtest/D700Tm/Sub/" .. UID] = 0,
+    -- 协议正式 topic（/s/${sn} + /scr/${sn}）
 }
+for topic, qos in pairs(topics.SUB_TABLE) do
+    SUB_TOPICS[topic] = qos
+end
 
 -- ============================================================
 -- 连接行为参数
@@ -140,8 +141,7 @@ local function mqtt_client_main_task_func()
         log.info("mqtt.main", "SERVER       =", SERVER_ADDR .. ":" .. SERVER_PORT)
         log.info("mqtt.main", "UID          =", UID)
         log.info("mqtt.main", "CLIENT_ID    =", CLIENT_ID)
-        log.info("mqtt.main", "TOPIC_UP     =", TOPIC_UP)
-        log.info("mqtt.main", "TOPIC_DOWN   =", TOPIC_DOWN)
+        log.info("mqtt.main", "SUB_TOPICS   =", json.encode(SUB_TOPICS))
         log.info("mqtt.main", "USERNAME     =", USERNAME == "" and "(空)" or USERNAME)
         log.info("mqtt.main", "PASSWORD     =", PASSWORD == "" and "(空)" or PASSWORD:gsub(".", "*"))
         log.info("mqtt.main", "CLEAN_SESSION=", CLEAN_SESSION, "KEEPALIVE=", KEEPALIVE_SEC .. "s")
@@ -248,6 +248,5 @@ end
 sys.taskInitEx(mqtt_client_main_task_func, TASK_NAME)
 
 return {
-    TOPIC_UP   = TOPIC_UP,
-    TOPIC_DOWN = TOPIC_DOWN,
+    TOPICS = topics,
 }

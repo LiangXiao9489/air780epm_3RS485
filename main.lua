@@ -24,8 +24,8 @@ require "net_4g"
 -- require "net_watchdog"
 
 -- Modbus 网关：主站轮询 u1（下行采集）+ 从站响应 u2（上行透传/写穿透）
-require "master"
-require "slave"
+-- require "master"
+-- require "slave"
 
 -- MQTT 客户端：建链 / 订阅 / 上下行收发（wireless/mqtt/）
 require "basic"
