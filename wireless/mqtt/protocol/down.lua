@@ -34,6 +34,7 @@ local downlink_lock   = require "downlink_uart_lock"
 local up              = require "up"
 local ack             = require "ack"
 local sender          = require "sender"
+local report          = require "report"
 
 local down = {}
 
@@ -147,15 +148,24 @@ local TOPIC_HANDLERS = {
                     local result = {}
 
                     for _, tag in ipairs(ts) do
-                        local reg = store.get_reg_by_tag(did, tag)
-                        if not reg then
+                        local slot = store.get_slot_by_tag(did, tag)
+                        if not slot then
                             log.warn("mqtt.down", "call tag 不存在", dev_id, tag)
-                            result[tag] = { q = store.ERR_UNINIT, t = now_str(), v = 0 }
+                            -- 协议：q 是质量位 0/1，拿不到点位按质量差处理
+                            result[tag] = { q = "0", t = tostring(os.time()), v = "0" }
                         else
-                            local data, errcode = store.read_by_tag(did, tag)
-                            result[tag] = { q = errcode or 0, t = now_str(), v = data or 0 }
+                            local ts = slot.ts
+                            if not ts or ts == 0 then ts = os.time() end
+                            result[tag] = {
+                                q = (slot.errcode == 0) and "1" or "0",
+                                t = tostring(ts),
+                                v = tostring(slot.data or 0),
+                            }
                         end
                     end
+
+                    -- 协议：mid 放在设备对象里，和 tag 平级
+                    if mid ~= nil then result.mid = mid end
 
                     local payload = up.with_time("callack", now_str(), { [dev_id] = result })
                     sender.publish(topics.UP_DATA, payload, 1)
@@ -228,13 +238,15 @@ local TOPIC_HANDLERS = {
         end,
     },
 
-    -- /scr/${sn}：控制下行（TODO，第五步实现）
+    -- /scr/${sn}：控制下行
     [topics.SUB_CONTROL] = {
+        -- 首页实时数据快速上传：立即上报一次，之后按 iv 周期上报，du 秒后恢复
         indexReal = function(msg)
             log.info("mqtt.down", "indexReal 快速上传",
                      "sti=" .. tostring(msg.sti),
                      "du=" .. tostring(msg.du),
                      "iv=" .. tostring(msg.iv))
+            report.start_index_real(msg)
         end,
 
         his = function(msg)

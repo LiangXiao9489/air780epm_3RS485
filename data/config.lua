@@ -45,7 +45,8 @@ local DEFAULT_CFG = {
     u2_parity    = "N",
 
     -- ---------- 业务参数 ----------
-    upload_interval_min = 5,   -- MQTT 实时数据上报间隔（分钟）
+    upload_interval_min = 5,   -- MQTT 实时数据上报间隔（分钟，需为整分钟对齐）
+    change_check_sec    = 5,   -- 变化数据检测周期（秒）
     write_through_en    = true,-- 是否允许 u2/MQTT 写穿透到热泵
 
     -- ---------- MQTT 传输层参数（basic.lua 里写死的可以逐步迁过来） ----------

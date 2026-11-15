@@ -115,6 +115,7 @@ function _M.init(pt)
                     n_addr  = n_addr,
                     data    = 0xFFFF,
                     errcode = _M.ERR_UNINIT,
+                    ts      = 0,          -- 最近一次采集时间（unix 秒），MQTT 上报用
                 }
                 cache_a[dev_id][s_addr] = slot
                 cache_b[dev_id][n_addr] = slot
@@ -167,6 +168,7 @@ function _M.write_by_a(dev_id, s_addr, data, err)
     end
     slot.data = data
     slot.errcode = err or 0
+    slot.ts = os.time()
     return true
 end
 
@@ -221,11 +223,13 @@ function _M.get_point_values()
 
                 local values = {}
                 local errcode = 0
+                local ts = 0
                 local dev_cache = cache_a[reg.dev_id] or {}
                 for i = 0, (reg.reg_count or 1) - 1 do
                     local slot = dev_cache[reg.base_s_addr + i]
                     if slot then
                         values[#values + 1] = slot.data
+                        if i == 0 then ts = slot.ts or 0 end
                         if errcode == 0 and slot.errcode and slot.errcode ~= 0 then
                             errcode = slot.errcode
                         end
@@ -244,6 +248,7 @@ function _M.get_point_values()
                     bits         = reg.bits,
                     values       = values,
                     errcode      = errcode,
+                    ts           = ts,
                 }
             end
         end
@@ -272,6 +277,14 @@ function _M.read_by_tag(dev_id, tag)
         return nil, _M.ERR_UNINIT
     end
     return _M.read_by_b(dev_id, reg.n_addr)
+end
+
+-- 按 (dev_id, tag) 取完整 slot（data / errcode / ts）
+-- MQTT 上报需要 ts（unix 秒），call/set 需要 errcode 转质量位
+function _M.get_slot_by_tag(dev_id, tag)
+    local reg = _M.get_reg_by_tag(dev_id, tag)
+    if not reg then return nil end
+    return cache_b[dev_id] and cache_b[dev_id][reg.n_addr]
 end
 
 return _M
