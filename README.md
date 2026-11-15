@@ -12,7 +12,7 @@
 
 - **u1（RS485_1）**：Modbus 主站，周期轮询下级 Modbus 从机，数据缓存到本地寄存器表
 - **u2（RS485_2）**：Modbus 从站，响应上位机的读请求（查缓存）和写请求（**写穿透**到 u1 上的从机）
-- **4G / MQTT**：按协议上行遥测数据（real / change / realIndex），下行接收 call / set / indexReal / ctr 指令
+- **4G / MQTT**：按协议上行遥测数据（real / change / realIndex），下行接收 call / set / indexReal 指令
 - **外部看门狗**：Air153C 硬件看门狗，GPIO28 喂狗，240s 超时兜底复位
 
 ### 关键特性
@@ -65,9 +65,9 @@ D700Tm_3RS485/
 │       └── protocol/                MQTT 协议层
 │           ├── topics.lua           topic 常量表（/s、/scr、/d、/dh、/dr、/dcr）+ SUB_TABLE
 │           ├── up.lua               上行 payload 拼装（with_time / without_time）
-│           ├── ack.lua              应答 payload 拼装（setack / indexRealAck / ctrAck / hisAck）
+│           ├── ack.lua              应答 payload 拼装（setack / indexRealAck / hisAck）
 │           ├── down.lua             下行解析 + 按 topic/type 分发（唯一入口 dispatch）
-│           └── report.lua           上行调度：real / change / realIndex / ctr 策略
+│           └── report.lua           上行调度：real / change / realIndex
 │
 ├── _extra/                          OpenLuat 官方 demo 库（gitignore，仅作 API 参考）
 │   ├── demo/fota/...                fota 核心库 / libfota2 扩展示例
@@ -237,9 +237,9 @@ I/user.mqtt.main ========================
 | 方向 | topic | 用途 | 状态 |
 |---|---|---|---|
 | 下行 | `/s/${sn}` | call / set | 已实现 |
-| 下行 | `/scr/${sn}` | indexReal / ctr / his | indexReal、ctr 已实现；his 未实现 |
+| 下行 | `/scr/${sn}` | indexReal / ctr / his | indexReal 已实现；ctr、his 未实现 |
 | 上行 | `/d/${sn}` | real / change / realIndex / callack / setack | 已实现 |
-| 上行 | `/dcr/${sn}` | indexRealAck / ctrAck / hisAck | 前两者已实现 |
+| 上行 | `/dcr/${sn}` | indexRealAck / ctrAck / hisAck | indexRealAck 已实现；其余未实现 |
 | 上行 | `/dh/${sn}` | 历史数据（数组版 payload） | 未实现 |
 | 上行 | `/dr/${sn}` | 断点续传（payload 与 `/d/` 相同） | 未实现 |
 
@@ -247,7 +247,7 @@ I/user.mqtt.main ========================
 
 | 字段 | 含义 |
 |---|---|
-| `t` | 报文类型：real / change / realIndex / callack / setack / indexRealAck / ctrAck |
+| `t` | 报文类型：real / change / realIndex / callack / setack / indexRealAck |
 | `ti` | 报文时间 `YYYY-MM-DD HH:MM:SS`；real 必须整 5 分钟 |
 | `d` | 数据体，第一层 key 是设备 id（当前点表里就是从机地址，如 `"1"`） |
 | `q` | 质量位 `"1"`/`"0"`，服务端只存 q=1 的点 |
@@ -256,11 +256,19 @@ I/user.mqtt.main ========================
 | `mid` | 下行请求的 messageId，原样在 ack 里带回 |
 | `r` | 应答结果：`{success:"all"}` 或 `{fail:[...], not_found:[...]}` |
 
+> **失败占位值 `0xFFFF`（65535）**
+>
+> master 采集失败时（串口超时 / 解帧失败 / 从机回异常帧 / 响应缺值），缓存写入的不是 0，而是 `0xFFFF` 并带上错误码，`t` 同步更新为失败时刻（见 `modbus/master.lua`）。因此：
+>
+> - `v="65535"` **不代表真实值**：`0xFFFF` 与真实值 65535 在数值上无法区分，**只能靠 `q` 判断** —— `q="1"` 才是真实采集值，`q="0"` 表示本次采集失败、`v` 是占位值。
+> - `change` 的判定同时比较 `v` 和 `q`，所以"值本来就是 0xFFFF、只是错误码变了"（`q` 1→0）同样会触发上报。
+> - 持续失败不会反复刷屏：首条 change 后快照已是 `{v=65535, q=0}`，后续结果相同就不再报；恢复通信时 `q` 回到 1，会再上报一条。
+
 ### 7.3 上行
 
 | 类型 | 触发 | 说明 |
 |---|---|---|
-| `real` | 每 `config.upload_interval_min` 分钟（默认 5） | 全量点位，`ti` 与各点 `t` 都对齐整点 |
+| `real` | 每 `config.upload_interval_min` 分钟（默认 5）；另有 set 成功后补发的一次（见 7.5） | 全量点位，`ti` 与各点 `t` 都对齐整点（补发那条除外） |
 | `change` | 每 `config.change_check_sec` 秒（默认 5）巡检 | 只报与快照不同的点，`ti` 用当前时间 |
 | `realIndex` | 收到 indexReal 后立即一次 + 每 `iv` 一次，`du` 秒后停 | 只报指令里的目标点 |
 
@@ -269,9 +277,46 @@ I/user.mqtt.main ========================
 | 类型 | 行为 |
 |---|---|
 | `call` | 按 `d[dev].ts` 查 store 缓存 → `callack`（`q`/`t`/`v`/`mid`） |
-| `set` | 多设备 × 每设备多属性，逐点写穿透 u1 → 更新缓存 → 每设备一条 `setack` |
+| `set` | 多设备 × 每设备多属性，逐点写穿透 u1 → 更新缓存 → 每设备一条 `setack` → 只要有写入成功就补发一条 `real` |
 | `indexReal` | 校验 `du`（-1/缺省或 >1800 不执行）→ 目标点位立即上报 + 按 `iv` 周期 → `indexRealAck` |
-| `ctr` | 设置点位上传策略（`ot` 开关 / `iv` 间隔 / `du` 时长 / `ts` 缺省=全设备）→ `ctrAck` |
+
+### 7.5 set 成功后补发 real（全量）
+
+协议 2.4 末尾：
+
+> iot 即使接到应答也不会修改自己的实时数据，需要控制器再发一条修改实时数据，格式与 2.1.1 相同。
+
+实现约定（已定稿）：
+
+| 项 | 约定 |
+|---|---|
+| 触发条件 | 一条 `set` 里**至少有一个点位写入成功**（`write_through_single` 返回 true） |
+| 不触发的情况 | 全部失败：`not_found`（点位不存在）、`fail`（只读 / `reg_count>1` / 值非数字 / 从机超时或异常） |
+| 上报范围 | **全量**：点表展开后的所有设备 × 所有点位，与整点 real 完全一致，不做点位过滤 |
+| `topic` / `t` | `/d/${sn}`，`t = "real"` |
+| `ti` | setack 发出后的当前时间，**不做整点对齐**（这条是"写入后立即补发"，不是整点 real） |
+| tag 内 `t` | 各点位自己最新的采集时间（被写入的点就是写入时刻） |
+| 顺序 | 先发该设备 `setack`，全部设备的 setack 发完后，再发这一条 real |
+| 防重复 | 补发后立即 `commit_snapshot()`，同一次写入不会被下一轮 `change` 重复上报 |
+| 落点 | `down.lua` 的 set handler → `report.send_real_after_set()` |
+
+报文示例（省略号代表其余点位，实际是全量）：
+
+```json
+{
+  "t": "real",
+  "ti": "2026-11-15 14:35:33",
+  "d": {
+    "1": {
+      "something1": { "q": "1", "t": "1794724533", "v": "123" },
+      "coilDemo":   { "q": "1", "t": "1794724533", "v": "1" },
+      "deviceSn":   { "q": "0", "t": "1794723722", "v": "65535" }
+    }
+  }
+}
+```
+
+> 如果服务端以后改成"合并更新"语义，只需在 `send_real_after_set` 里把 `build_data(nil, nil)` 的第一个参数换成 `{ [dev_id] = { [tag] = true } }` 过滤表，其他逻辑不用动。
 
 ---
 
@@ -341,12 +386,12 @@ I/user.mqtt.main ========================
 | 11 | 上行 realIndex（首页快速上传） | `report.start_index_real` | 已联调 |
 | 12 | 下行 call（查缓存） | `protocol/down.lua` | 已联调 |
 | 13 | 下行 set（多设备多属性写穿透） | `protocol/down.lua` | 已联调 |
-| 14 | 下行 ctr（采集点控制） | `report.apply_ctr` | 代码完成，未实测 |
-| 15 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
+| 14 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
 
 ### 10.2 本次范围外（明确不做）
 
 - `his` 历史召回 + `/dh` 上行
+- `ctr` 采集点控制（2.7）
 - 断点续传 `/dr`
 - OTA 升级、网关参数远程配置（协议未定义报文）
 - `alarm` 报警上报、设备 `on` / `off` 开关机（协议已标注整体废弃）
@@ -361,8 +406,9 @@ I/user.mqtt.main ========================
 | 项 | 协议章节 | 说明 |
 |---|---|---|
 | `his` 历史召回 | 2.6 | 需要本地历史存储子系统 + `/dh` 数组版 payload（元素带 `ta`）；当前 `down.lua` 的 his handler 只打日志 |
+| `ctr` 采集点控制 | 2.7 | 完全未实现：没有策略表，`down.lua` 的 ctr handler 只打日志；需要 `ot` 开关 / `iv` 间隔 / `du` 时长 + `ctrAck` |
 | 断点续传 `/dr` | 2.1.1 注 | 断网期间 real 数据补传，需要历史缓存 + 发送进度持久化 |
-| `sti` 预约生效 | 2.5 / 2.7 | indexReal、ctr 的 `sti`（开始时间）都没实现，当前一律"收到即生效" |
+| `sti` 预约生效 | 2.5 | indexReal 的 `sti`（开始时间）未实现，当前"收到即生效" |
 | 多寄存器点位 set | 2.4 | `reg_count > 1` 的点不支持 `set`，直接进 `fail` |
 | OTA 升级 | 无 | 协议未定义报文；`_extra/pre_version/src_user/user_ota.lua` 是实测可用的旧实现 |
 | 网关参数远程配置 | 无 | 协议未定义报文；当前只有 `config.factory_reset()` 本地接口 |
@@ -371,12 +417,9 @@ I/user.mqtt.main ========================
 
 | # | 问题 | 协议原文 | 当前实现 |
 |---|---|---|---|
-| 1 | ctr 的 `du > 1800` 被拒绝执行 | 2.7 只写"`-1` 永远，正常时间单位秒"，**没有 1800 限制**（该限制只出现在 2.5 indexReal / 2.6 his） | `report.apply_ctr` 直接回 `fail` 不执行 → 应去掉 |
-| 2 | indexReal 的 `iv` 被 clamp 到 1~60 秒 | 2.5 未限定 `iv` 上限 | `start_index_real` 里 `if iv_sec > 60 then iv_sec = 60` |
-| 3 | setack 未带回当前值 | 2.4 上行示例里同时带 `tag1:{q,t,v}`（文档自己也标"暂时不确定"） | 只回 `r` + `mid` |
-| 4 | 写入后不补 `real` | 2.4 注：iot 收到 setack 不会改实时数据，**需要控制器再发一条格式与 2.1.1 相同（real）的上报** | 写完更新缓存，只等下一轮 `change` 上报，`type` 是 change 不是 real |
-| 5 | `fail` 语义被扩大 | 2.4 中 `fail` 指"设置失败（如设备断电）" | 代码还把"点位不可写 `rw~="rw"` / 多寄存器 / 值非数字"都归入 `fail` |
-| 6 | real 间隔可配 | 2.1.1 要求"必须整 5 分钟" | 按 `config.upload_interval_min` 对齐，改非 5 就违反协议 |
+| 1 | setack 未带回当前值 | 2.4 上行示例里同时带 `tag1:{q,t,v}`（文档自己也标"暂时不确定"） | 只回 `r` + `mid` |
+| 2 | `fail` 语义被扩大 | 2.4 中 `fail` 指"设置失败（如设备断电）" | 代码还把"点位不可写 `rw~="rw"` / 多寄存器 / 值非数字"都归入 `fail` |
+| 3 | real 间隔可配 | 2.1.1 要求"必须整 5 分钟" | 按 `config.upload_interval_min` 对齐，改非 5 就违反协议 |
 
 ### 11.3 语义不明（需与服务端确认）
 
@@ -386,9 +429,6 @@ I/user.mqtt.main ========================
 | 2 | 设备 id 命名规则 | 协议示例是 `C1_D1`，点表 `dev_id` 是从机地址数字（`1`/`2`）；`down.lua` 用 `tonumber` 归一化，`"C1_D1"` 这类字符串会查不到点表 |
 | 3 | tag 命名规则 | 协议示例是 `tag1`/`tag2`，实际点表是 `something1`/`机组状态`；若服务端固定发 `tagN`，需要加 `num ↔ tag` 映射 |
 | 4 | `change` 的 `ti`/`t` 是否也要整点 | 协议只要求 real 整点；当前 change 用当前时间 |
-| 5 | ctr 的 `sti` 是否真的会下发 | 不下发则无需实现预约逻辑 |
-| 6 | ctr 与 indexReal 同时命中同一点位谁优先 | 当前互不干扰：indexReal 决定上报周期，ctr 决定开关与 change 节流 |
-| 7 | `ctr` 的 `iv` 是否只作用于 change | 当前 real 仍按整点全量上报，`iv` 只节流 change |
 
 ### 11.4 工程风险（非协议问题）
 

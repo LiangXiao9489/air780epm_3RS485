@@ -183,6 +183,7 @@ local TOPIC_HANDLERS = {
                     return
                 end
                 local d = msg.d or {}
+                local any_written = false
                 for dev_id, body in pairs(d) do
                     local did = norm_dev(dev_id)
                     local mid = body.mid
@@ -213,7 +214,9 @@ local TOPIC_HANDLERS = {
                                     fail_tags[#fail_tags + 1] = tag
                                     log.warn("mqtt.down", "set 值非法", dev_id, tag, val)
                                 else
-                                    if not write_through_single(reg, num_val) then
+                                    if write_through_single(reg, num_val) then
+                                        any_written = true
+                                    else
                                         all_ok = false
                                         fail_tags[#fail_tags + 1] = tag
                                     end
@@ -233,6 +236,12 @@ local TOPIC_HANDLERS = {
                     end
                     local payload = ack.build("setack", dev_id, result, mid)
                     sender.publish(topics.UP_DATA, payload, 1)
+                end
+
+                -- 协议 2.4 注：写入成功后 iot 不会改自己的实时数据，需要补一条 real。
+                -- 全部失败时原值没变，不需要补。
+                if any_written then
+                    report.send_real_after_set()
                 end
             end)
         end,

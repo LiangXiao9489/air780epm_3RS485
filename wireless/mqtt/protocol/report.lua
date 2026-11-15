@@ -177,6 +177,23 @@ local function send_real(boundary_ts)
     log.info("mqtt.report", "real 上报完成", "ti=" .. now_str(boundary_ts))
 end
 
+-- set 成功后补发一条 real（协议 2.4 注：iot 收到 setack 不会改自己的实时数据，
+-- 需要控制器再发一条格式与 2.1.1 相同的数据；由 down.lua 在确有写入成功时调用）
+function report.send_real_after_set()
+    if not store_ready() then return end
+    if not time_ok("real") then return end
+
+    local now = os.time()
+    -- 不做整点对齐：各点用自己最新的采集时间，ti 用当前时间
+    local d = build_data(nil, nil)
+    if not has_any(d) then return end
+
+    sender.publish(topics.UP_DATA, up.with_time("real", now_str(now), d), 1)
+    -- 更新快照，避免同一次写入又被 change 重复上报
+    commit_snapshot()
+    log.info("mqtt.report", "set 后补发 real", "ti=" .. now_str(now))
+end
+
 local function send_change()
     if not store_ready() then return end
     if not time_ok("change") then return end
@@ -226,7 +243,6 @@ function report.start_index_real(msg)
 
     local iv_sec = IV_IS_SECOND and iv or (iv / 1000)
     if iv_sec < 1 then iv_sec = 1 end
-    if iv_sec > 60 then iv_sec = 60 end
 
     local targets = {}
     local acks = {}
