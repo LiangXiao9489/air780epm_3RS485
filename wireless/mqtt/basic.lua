@@ -6,7 +6,7 @@
 @usage
 本文件是 mqtt 应用的总调度，核心业务逻辑：
 1、创建 mqtt client，连接 broker（地址、端口、账密、主题全部写死在本文件顶部）；
-2、连接成功后按 SUB_TOPICS 表批量订阅（当前 1 个下行主题，加一行即可扩展多个）；
+2、连接成功后按 SUB_TOPICS 表批量订阅（内容来自 protocol/topics.lua 的 SUB_TABLE）；
 3、把 broker 事件翻译成内部 "MQTT_EVENT" 消息分发给各 task：
    - "CONNECT" / "SUBSCRIBE" / "UNSUBSCRIBE" / "DISCONNECTED" / "ERROR" 给自己；
    - "PUBLISH_OK" 给 sender task，用于串行推进发送队列；
@@ -45,13 +45,8 @@ local CLEAN_SESSION = true
 local UID = mcu.unique_id():toHex()
 local CLIENT_ID = "YEDtest_D700Tm_mqtt_" .. UID
 
--- 订阅表：同时订阅测试 topic 和协议正式 topic，两边都能下行
--- 正式 topic 格式由 protocol/topics.lua 统一管理，以后 basic.lua 全部接过去
-local SUB_TOPICS = {
-    -- 测试 topic（当前 broker.emqx.io 订阅的）
-    ["YEDtest/D700Tm/Sub/" .. UID] = 0,
-    -- 协议正式 topic（/s/${sn} + /scr/${sn}）
-}
+-- 订阅表：内容全部来自协议层 topics.SUB_TABLE（/s/${sn} + /scr/${sn}）
+local SUB_TOPICS = {}
 for topic, qos in pairs(topics.SUB_TABLE) do
     SUB_TOPICS[topic] = qos
 end

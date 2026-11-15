@@ -12,7 +12,7 @@
 
 - **u1（RS485_1）**：Modbus 主站，周期轮询下级 Modbus 从机，数据缓存到本地寄存器表
 - **u2（RS485_2）**：Modbus 从站，响应上位机的读请求（查缓存）和写请求（**写穿透**到 u1 上的从机）
-- **4G / MQTT**：上行上报遥测数据，下行接收 JSON 指令（预留写穿透通道）
+- **4G / MQTT**：按协议上行遥测数据（real / change / realIndex），下行接收 call / set / indexReal / ctr 指令
 - **外部看门狗**：Air153C 硬件看门狗，GPIO28 喂狗，240s 超时兜底复位
 
 ### 关键特性
@@ -21,12 +21,14 @@
 |---|---|---|
 | 1 | 多从机支持 | 点表 `slave_dev={1,2,...}` 列出从机地址，共用一份寄存器模板 |
 | 2 | 多寄存器类型 | 线圈(0x01) / 离散(0x02) / 保持(0x03) / 输入(0x04)，读写权限区分 |
-| 3 | 写穿透 | u2 收到上位机写指令 → 抢占 u1 总线 → 向从机下发 → 回显 |
-| 4 | 多通道串行化 | 所有对 u1 的事务共用一把互斥锁，主站轮询/从站写穿透/MQTT 写穿透互不打架 |
+| 3 | 写穿透 | u2 或 MQTT 收到写指令 → 抢占 u1 总线 → 向从机下发 → 回显 / 回 ack |
+| 4 | 多通道串行化 | 所有对 u1 的事务共用一把互斥锁，主站轮询 / 从站写穿透 / MQTT 写穿透互不打架 |
 | 5 | MQTT 完整生命周期 | create → auth → connect → subscribe → keepalive → 退避重连 |
-| 6 | 队列式上行 | sender 串行发送，断线不丢，qos0/qos1 兼容 |
-| 7 | 芯片 UID 身份 | MQTT ClientID/Topic 用 `mcu.unique_id():toHex()`，不依赖 SIM |
-| 8 | 部署参数集中打印 | 上电网络就绪后一次打出 broker/UID/topic 等，现场排查用 |
+| 6 | 队列式上行 | sender 串行发送，断线不丢，qos0/qos1 兼容，队列 64 条封顶 |
+| 7 | 芯片 UID 身份 | MQTT ClientID / topic 后缀用 `mcu.unique_id():toHex()`，不依赖 SIM |
+| 8 | 协议分层 | topic / 上行拼装 / ack 拼装 / 下行解析 / 上报调度各自一个文件 |
+| 9 | 配置持久化 | `data/config.lua` 存 `/gateway_cfg.json`，OTA 新增字段自动 fallback 默认值 |
+| 10 | 时间可信 | NITZ 基站校时 + `socket.sntp()`，时间未同步前拒绝上报假时间戳 |
 
 ---
 
@@ -34,7 +36,11 @@
 
 ```
 D700Tm_3RS485/
-├── main.lua                         入口文件：初始化 + 依次 require 各模块 + sys.run()
+├── main.lua                         入口：版本/UID 打印 + 配置快照 + 依次 require + sys.run()
+│
+├── data/                            跨模块共享数据
+│   ├── store.lua                    寄存器缓存（主站写 / 从站读）+ tag 索引 + slot.ts
+│   └── config.lua                   配置 JSON 持久化（/gateway_cfg.json）+ factory_reset
 │
 ├── device/                          硬件相关
 │   └── ext_wdt.lua                  Air153C 外部看门狗喂狗（GPIO28，120s 间隔）
@@ -42,25 +48,32 @@ D700Tm_3RS485/
 ├── modbus/                          Modbus 协议层（纯协议，不知道 MQTT）
 │   ├── hardware.lua                 RS485 纯管道：2 路串口独立 send/wait_response
 │   ├── core.lua                     Modbus RTU 编解码引擎（CRC16 / 组帧 / 解帧 / 异常码）
-│   ├── shared.lua                   共享层：寄存器缓存 + u1 互斥锁（lock/unlock/has_waiter）
-│   ├── point_table.lua              点表配置：从机地址 + 寄存器模板（s_addr / n_addr / reg_type / reg_count）
+│   ├── downlink_uart_lock.lua       u1 总线互斥锁（lock / unlock / has_waiter，超时 800ms）
+│   ├── point_table.lua              点表配置：从机地址 + 寄存器模板
 │   ├── master.lua                   主站轮询 task（走 u1，每 block 先 lock）
 │   └── slave.lua                    从站响应 task（走 u2，读查缓存，写穿透 u1）
 │
-├── wireless/
-│   ├── 4g/                          蜂窝网络
-│   │   └── net_4g.lua               SIM 通道 / IMEI / DNS / IP_READY 监听
+├── wireless/                        与无线 / 云端相关的部分
+│   ├── 4g/
+│   │   ├── net_4g.lua               SIM 通道 / IMEI / DNS / IP_READY 监听
+│   │   └── sntp.lua                 NTP 校时（IP_READY 后同步，成功 1 小时一次，失败 10s 重试）
 │   │
-│   └── mqtt/                        MQTT 客户端（三层解耦）
-│       ├── basic.lua                总调度：建链 / 订阅 / 事件分发 / 退避重连
+│   └── mqtt/
+│       ├── basic.lua                总调度：建链 / 订阅 / 事件分发 / 退避重连 / 部署参数打印
 │       ├── sender.lua               上行发送队列：串行 / 断线保留 / PUBLISH_OK 推进
-│       └── receiver.lua             下行入队：task 内批量取空 + 分段日志
+│       ├── receiver.lua             下行入队：task 内批量取空 → down.dispatch
+│       └── protocol/                MQTT 协议层
+│           ├── topics.lua           topic 常量表（/s、/scr、/d、/dh、/dr、/dcr）+ SUB_TABLE
+│           ├── up.lua               上行 payload 拼装（with_time / without_time）
+│           ├── ack.lua              应答 payload 拼装（setack / indexRealAck / ctrAck / hisAck）
+│           ├── down.lua             下行解析 + 按 topic/type 分发（唯一入口 dispatch）
+│           └── report.lua           上行调度：real / change / realIndex / ctr 策略
 │
 ├── _extra/                          OpenLuat 官方 demo 库（gitignore，仅作 API 参考）
 │   ├── demo/fota/...                fota 核心库 / libfota2 扩展示例
 │   ├── demo/http/...                http.request 下载到文件系统示例
 │   ├── demo/crypto/...              crypto.crc32 / md5 示例
-│   └── ...
+│   └── pre_version/src_user/        旧版本可运行代码（含 OTA / SNTP 参考实现）
 │
 └── README.md                        本文件
 ```
@@ -71,17 +84,21 @@ D700Tm_3RS485/
 
 ```
 main.lua
- ├── sys（LuatOS 内置）
- ├── ext_wdt        独立，不依赖任何业务模块
+ ├── config         → 无业务依赖（JSON 文件持久化）
+ ├── ext_wdt        独立
  ├── net_4g         独立，设置 SIM / DNS，发布 IP_READY
- ├── master         → shared + point_table + core + hardware
- ├── slave          → shared + point_table + core + hardware
- └── basic          → sender + receiver
+ ├── sntp           独立，IP_READY 后 NTP 校时
+ ├── master         → store + point_table + core + hardware + downlink_uart_lock
+ ├── slave          → store + point_table + core + hardware + downlink_uart_lock
+ └── basic          → sender + receiver + topics
+                       receiver → down
+                         down   → topics + store + core + hardware + downlink_uart_lock
+                                  + up + ack + sender + report
+                         report → topics + store + up + ack + sender + config
                        sender  ←  basic（connect 时把 mqtt_client 交给它）
-                       receiver ← basic（recv 事件回调里调用 proc 入队）
 ```
 
-**关键设计**：硬件层（hardware）、协议层（core）、业务编排层（master/slave/basic）三层严格解耦。新增 MQTT 写穿透通道时，**只需要加一个模块**，里面直接 `shared.lock()` + `uart485.u1_send()`，不碰 hardware/core/shared 任何一行。
+**关键设计**：硬件层（hardware）、Modbus 协议层（core）、数据层（store）、无线协议层（mqtt/protocol）、业务编排层（master / slave / basic）严格解耦。新增一个对上通道（例如 CAN 转 MQTT）时，**只需要加一个模块**，里面直接 `downlink_lock.lock()` + `uart485.u1_send()`，不碰 hardware / core / store 任何一行。
 
 ---
 
@@ -93,11 +110,11 @@ main.lua
 master task（每 5s 一轮）
   └── 按 (dev_id, reg_type, s_addr) 排序合并连续地址为 blocks
       └── 每个 block:
-           shared.lock("master_poll")
+           downlink_lock.lock("master_poll")
              hardware.u1_send(adu)          [485 半双工，EN 自动翻转]
              hardware.u1_wait_response(800ms)
-           shared.unlock()
-           core.decode_response → shared.write_by_a（更新缓存 slot.data / slot.errcode）
+           downlink_lock.unlock()
+           core.decode_response → store.write_by_a（更新缓存 slot.data / slot.errcode / slot.ts）
 ```
 
 ### 4.2 从站响应（上行 u2）
@@ -105,13 +122,13 @@ master task（每 5s 一轮）
 ```
 硬件从上位机收到 Modbus 帧 → hardware 接收回调 → resp_buffer → sys.publish
   └── slave task（u2_wait_response 等帧 → decode_request → 按 fc 分发）
-      ├── 0x01/0x02/0x03/0x04 读 → shared.read_by_b 查缓存 → encode_response
+      ├── 0x01/0x02/0x03/0x04 读 → store.read_by_b 查缓存 → encode_response
       └── 0x05/0x06/0x0F/0x10 写 → 组 u1 写穿透 ADU →
-             shared.lock("slave_write_XX")
+             downlink_lock.lock("slave_write_XX")
                hardware.u1_send(adu)
                hardware.u1_wait_response(2000ms)
-             shared.unlock()
-             decode_response → shared.write_by_a（同步更新缓存）
+             downlink_lock.unlock()
+             decode_response → store.write_by_a（同步更新缓存）
              encode_response → u2_send 回显
 ```
 
@@ -119,35 +136,35 @@ master task（每 5s 一轮）
 
 ```
 上行（业务模块 → broker）：
-  sender.publish(topic, payload, qos, cb) → send_queue →
+  report / down → sender.publish(topic, payload, qos) → send_queue →
   mqtt_client:publish → 等 PUBLISH_OK → 发下一条
   qos0 无 PUBACK，publish 返回即视为成功
 
 下行（broker → 设备）：
   mqtt 事件回调 recv → receiver.proc（只入队，不解析）
-  receiver task → sys.waitMsg → 批量取空 → 分段打印
-  （协议确定后在此处按 msg.cmd 分发）
+  receiver task → sys.waitMsg → 批量取空 → down.dispatch(topic, payload)
+    → 按 topic 选 handler 表 → 按 msg.t 选 handler → 业务处理 → sender.publish(ack)
 ```
 
 ### 4.4 u1 总线互斥（核心）
 
-RS485 半双工**物理上不支持并发**。所有对 u1 的 Modbus 事务（主站轮询、从站写穿透、未来 MQTT 写穿透）共用 `shared.lua` 里的一把锁：
+RS485 半双工**物理上不支持并发**。所有对 u1 的 Modbus 事务（主站轮询、从站写穿透、MQTT 写穿透）共用 `downlink_uart_lock.lua` 里的一把锁：
 
 ```lua
 -- 主站轮询
-shared.lock("master_poll")
+downlink_lock.lock("master_poll")
 uart485.u1_send(adu)
 uart485.u1_wait_response(800)
-shared.unlock()
+downlink_lock.unlock()
 
--- 从站写穿透（完全一样的模式）
-shared.lock("slave_write_06")
+-- 从站 / MQTT 写穿透（完全一样的模式）
+downlink_lock.lock("mqtt_set")
 uart485.u1_send(adu)
 uart485.u1_wait_response(2000)
-shared.unlock()
+downlink_lock.unlock()
 ```
 
-锁的范围 = **一个完整 Modbus 事务**（发请求 → 等响应 → 释放）。超时 800ms，多个等待者 FIFO 唤醒。主站每 block 前先 `shared.has_waiter()` 让出，避免饿死写穿透。
+锁的范围 = **一个完整 Modbus 事务**（发请求 → 等响应 → 释放），中途绝不释放。等锁超时 800ms，多个等待者先到先得；主站每 block 前先 `has_waiter()` 让出，避免饿死写穿透。
 
 ---
 
@@ -160,28 +177,19 @@ return {
         slave_dev = {1, 2},          -- 多台从机，共用下面这份 regs 模板
     },
     regs = {
-        -- 示例 1：单寄存器 holding，从机 s_addr=100，上位机 n_addr=1000
-        {
-            num=1, tag="冷却温度", reg_type=3, rw="rw",
-            s_addr=100, n_addr=1000, reg_count=1,
-            data_type="u16", scale_factor=0.1,
-        },
-        -- 示例 2：多寄存器 holding，占用 2 个寄存器 (u32)
-        {
-            num=2, tag="累计电量", reg_type=3, rw="rw",
-            s_addr=200, n_addr=2000, reg_count=2,
-            data_type="u32", scale_factor=1,
-        },
-        -- 示例 3：coil（线圈），单 bit
-        {
-            num=3, tag="启动/停止", reg_type=1, rw="rw",
-            s_addr=0, n_addr=3000, reg_count=1,
-        },
+        { num=1, tag="something1", reg_type=3, rw="rw",
+          s_addr=5000, n_addr=6400, reg_count=1,
+          data_type="u16", scale_factor=1 },
+        { num=2, tag="multiHoldingReg", reg_type=3, rw="rw",
+          s_addr=756, n_addr=252, reg_count=4,
+          data_type="u64", scale_factor=1 },
+        { num=3, tag="coilDemo", reg_type=1, rw="rw",
+          s_addr=5100, n_addr=6500, reg_count=1 },
     },
 }
 ```
 
-启动时 `shared.init(pt)` 会自动展开成 `从机数 × regs` 份 slot，双向索引（cache_a 供主站轮询写、cache_b 供从站读）。
+启动时 `store.init(pt)` 自动展开成 `从机数 × regs` 份 slot，双向索引（cache_a 供主站轮询写、cache_b 供从站读），并建 `regs_by_tag[dev_id][tag]` 索引供 MQTT 的 call / set 使用。
 
 | 字段 | 含义 |
 |---|---|
@@ -191,21 +199,20 @@ return {
 | `n_addr` | 上行寄存器地址（从站响应上位机用） |
 | `reg_count` | 点位占用的寄存器个数，默认 1 |
 | `scale_factor` | 原始值 × 系数 = 实际物理量（本地计算用） |
-| `bits` | 可选，一个 16 位寄存器里装多个 bit 开关量 |
+| `bits` | 可选，一个 16 位寄存器里装多个 bit 开关量（仅本地解析参考） |
 
 ---
 
 ## 六、MQTT 部署参数
 
-所有参数集中在 `wireless/mqtt/basic.lua` 文件顶部，启动时会自动打印：
+地址、账密、ClientID 集中在 `wireless/mqtt/basic.lua` 顶部；topic 由 `wireless/mqtt/protocol/topics.lua` 统一生成。上电网络就绪后自动打印：
 
 ```
 I/user.mqtt.main ======= 部署参数 =======
 I/user.mqtt.main SERVER       = broker.emqx.io:1883
 I/user.mqtt.main UID          = 03230619179356C9
 I/user.mqtt.main CLIENT_ID    = YEDtest_D700Tm_mqtt_03230619179356C9
-I/user.mqtt.main TOPIC_UP     = YEDtest/D700Tm/Pub/03230619179356C9
-I/user.mqtt.main TOPIC_DOWN   = YEDtest/D700Tm/Sub/03230619179356C9
+I/user.mqtt.main SUB_TOPICS   = {"/scr/03230619179356C9":0,"/s/03230619179356C9":0}
 I/user.mqtt.main USERNAME     = (空)
 I/user.mqtt.main PASSWORD     = (空)
 I/user.mqtt.main CLEAN_SESSION= true KEEPALIVE= 60s
@@ -214,18 +221,61 @@ I/user.mqtt.main ========================
 
 | 参数 | 说明 |
 |---|---|
-| `UID` | `mcu.unique_id():toHex()`，8 字节硬件 UID，每颗模组不同 |
-| `CLIENT_ID` | MQTT 协议 ClientID，broker 靠它区分设备；格式 `YEDtest_D700Tm_mqtt_<UID>` |
-| `TOPIC_UP` | 上行发布主题：`YEDtest/D700Tm/Pub/<UID>` |
-| `TOPIC_DOWN` | 下行订阅主题：`YEDtest/D700Tm/Sub/<UID>` |
+| `UID` | `mcu.unique_id():toHex()`，8 字节硬件 UID（16 个 hex 字符），每颗模组不同 |
+| `CLIENT_ID` | MQTT ClientID，broker 靠它区分设备；格式 `YEDtest_D700Tm_mqtt_<UID>` |
+| `SUB_TOPICS` | 内容全部来自 `topics.SUB_TABLE`，当前为 `/s/${sn}` + `/scr/${sn}` |
+| `sn` | 协议里的网关号，等于 UID |
 | `KEEPALIVE_SEC` | 心跳 60s，小于网络看门狗一半 |
 | `RECONNECT_DELAY_MIN/MAX` | 重连退避 5s 起步，翻倍至 30s 封顶 |
 
-> ⚠️ 改 topic 前缀或 CLIENT_ID 格式后，**broker 端的订阅也要同步改**。UID 版本下，每台设备 topic 唯一，不存在互相踢掉的风险（之前 IMEI 兜底 `"DEV0001"` 会撞车）。
+---
+
+## 七、MQTT 协议实现
+
+### 7.1 topic
+
+| 方向 | topic | 用途 | 状态 |
+|---|---|---|---|
+| 下行 | `/s/${sn}` | call / set | 已实现 |
+| 下行 | `/scr/${sn}` | indexReal / ctr / his | indexReal、ctr 已实现；his 未实现 |
+| 上行 | `/d/${sn}` | real / change / realIndex / callack / setack | 已实现 |
+| 上行 | `/dcr/${sn}` | indexRealAck / ctrAck / hisAck | 前两者已实现 |
+| 上行 | `/dh/${sn}` | 历史数据（数组版 payload） | 未实现 |
+| 上行 | `/dr/${sn}` | 断点续传（payload 与 `/d/` 相同） | 未实现 |
+
+### 7.2 字段语义
+
+| 字段 | 含义 |
+|---|---|
+| `t` | 报文类型：real / change / realIndex / callack / setack / indexRealAck / ctrAck |
+| `ti` | 报文时间 `YYYY-MM-DD HH:MM:SS`；real 必须整 5 分钟 |
+| `d` | 数据体，第一层 key 是设备 id（当前点表里就是从机地址，如 `"1"`） |
+| `q` | 质量位 `"1"`/`"0"`，服务端只存 q=1 的点 |
+| `t`（tag 内） | 采集时间，unix 秒字符串 |
+| `v` | 值，字符串 |
+| `mid` | 下行请求的 messageId，原样在 ack 里带回 |
+| `r` | 应答结果：`{success:"all"}` 或 `{fail:[...], not_found:[...]}` |
+
+### 7.3 上行
+
+| 类型 | 触发 | 说明 |
+|---|---|---|
+| `real` | 每 `config.upload_interval_min` 分钟（默认 5） | 全量点位，`ti` 与各点 `t` 都对齐整点 |
+| `change` | 每 `config.change_check_sec` 秒（默认 5）巡检 | 只报与快照不同的点，`ti` 用当前时间 |
+| `realIndex` | 收到 indexReal 后立即一次 + 每 `iv` 一次，`du` 秒后停 | 只报指令里的目标点 |
+
+### 7.4 下行
+
+| 类型 | 行为 |
+|---|---|
+| `call` | 按 `d[dev].ts` 查 store 缓存 → `callack`（`q`/`t`/`v`/`mid`） |
+| `set` | 多设备 × 每设备多属性，逐点写穿透 u1 → 更新缓存 → 每设备一条 `setack` |
+| `indexReal` | 校验 `du`（-1/缺省或 >1800 不执行）→ 目标点位立即上报 + 按 `iv` 周期 → `indexRealAck` |
+| `ctr` | 设置点位上传策略（`ot` 开关 / `iv` 间隔 / `du` 时长 / `ts` 缺省=全设备）→ `ctrAck` |
 
 ---
 
-## 七、硬件接线
+## 八、硬件接线
 
 | 模块 | 引脚 | 说明 |
 |---|---|---|
@@ -238,15 +288,15 @@ I/user.mqtt.main ========================
 
 ---
 
-## 八、编译与烧录
+## 九、编译与烧录
 
-### 8.1 固件镜像要求
+### 9.1 固件镜像要求
 
 - **硬件**：Air780EPM（EC718PM 内核）
 - **内核版本**：V2016 及以上（支持 `mcu.unique_id()`、`crypto.crc32` 多参数、`io.dexist` 等新 API）
 - **文件系统**：约 168 KB（内置 flash）
 
-### 8.2 LuatTools 脚本搜索路径
+### 9.2 LuatTools 脚本搜索路径
 
 必须包含以下目录（LuatOS 静态扫描打包）：
 
@@ -254,81 +304,123 @@ I/user.mqtt.main ========================
 工程根目录/
 ├── main.lua                            ← 根目录本身
 ├── modbus/                             ← 6 个文件
-├── wireless/mqtt/                      ← 3 个文件（basic/sender/receiver）
-├── wireless/4g/                        ← 2 个文件（net_4g/net_watchdog）
-└── device/                             ← 1 个文件（ext_wdt）
+├── data/                               ← 2 个文件（store / config）
+├── device/                             ← 1 个文件（ext_wdt）
+├── wireless/4g/                        ← 2 个文件（net_4g / sntp）
+└── wireless/mqtt/                      ← 3 个文件（basic / sender / receiver）
+    └── protocol/                       ← 5 个文件（topics / up / ack / down / report）
 ```
 
 > `_extra/` 目录（OpenLuat 官方 demo）通过 `.gitignore` 排除，不参与打包，只作 API 参考。
 
-### 8.3 打包注意
+### 9.3 打包注意
 
 - `require` 名称必须是**字符串字面量**，LuatTools 扫不到变量拼接
+- 所有 `require` 直接写模块名（如 `require "store"`），不带路径
 - 核心库（`json`、`pack`、`crypto`、`socket`、`mqtt`、`fota`、`io`、`uart`、`mcu`、`mobile`）LuatOS 已内置，**不需要 require**
-- `crypto.crc32(data, start, poly, xorout)` 是 2025.4.14 新增的多参数形式，必须用 V2016+ 固件
+- 本地烧录调试时，删掉文件系统里的 `/gateway_cfg.json`，代码里的默认参数才会重新写入
 
 ---
 
-## 九、扩展指南
+## 十、功能实现状态
 
-### 9.1 新增 4G 写穿透通道
+### 10.1 已实现
 
-```
-broker → MQTT receiver.task（解析 JSON 里的写指令）
-  → sys.taskInit 独立 task（避免阻塞 receiver）
-    → 点表校验（dev_id + n_addr → reg_type == 3 且 rw == "rw"）
-    → core.encode_request 组 ADU（s_addr）
-    → shared.lock("mqtt_write")
-        uart485.u1_send(adu)
-        hardware.u1_wait_response(2000)
-      shared.unlock()
-    → decode_response → shared.write_by_a
-    → sender.publish(ack)
-```
+| # | 功能 | 落点 | 状态 |
+|---|---|---|---|
+| 1 | u1 主站轮询采集 | `modbus/master.lua` | 已联调 |
+| 2 | u2 从站读写 + 写穿透 | `modbus/slave.lua` | 已联调 |
+| 3 | u1 总线互斥 | `modbus/downlink_uart_lock.lua` | 已联调 |
+| 4 | 寄存器缓存 + 采集时间 | `data/store.lua` | 已联调 |
+| 5 | 配置持久化 + 出厂恢复 | `data/config.lua` | 已联调 |
+| 6 | 4G 拨号 / DNS / SIM 状态 | `wireless/4g/net_4g.lua` | 已联调 |
+| 7 | NTP 校时 | `wireless/4g/sntp.lua` | 已联调 |
+| 8 | MQTT 建链 / 订阅 / 重连 / 参数打印 | `wireless/mqtt/basic.lua` | 已联调 |
+| 9 | 上行 real（整 5 分钟全量） | `protocol/report.lua` | 已联调 |
+| 10 | 上行 change（变化上报） | `protocol/report.lua` | 已联调 |
+| 11 | 上行 realIndex（首页快速上传） | `report.start_index_real` | 已联调 |
+| 12 | 下行 call（查缓存） | `protocol/down.lua` | 已联调 |
+| 13 | 下行 set（多设备多属性写穿透） | `protocol/down.lua` | 已联调 |
+| 14 | 下行 ctr（采集点控制） | `report.apply_ctr` | 代码完成，未实测 |
+| 15 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
 
-### 9.2 新增寄存器点位
+### 10.2 本次范围外（明确不做）
 
-编辑 `modbus/point_table.lua` 里的 `regs` 表，加一行模板。**启动时 `shared.init` 会自动展开**——主站轮询、从站响应、缓存 slot 全链路自动打通，不需要改其他模块。
-
-### 9.3 新增多从机
-
-把 `meta.slave_dev = {1}` 改成 `{1, 2, 3}`，其他同上。
-
-### 9.4 替换 broker 地址
-
-编辑 `wireless/mqtt/basic.lua` 顶部 `SERVER_ADDR / SERVER_PORT / USERNAME / PASSWORD` 四个变量即可。
+- `his` 历史召回 + `/dh` 上行
+- 断点续传 `/dr`
+- OTA 升级、网关参数远程配置（协议未定义报文）
+- `alarm` 报警上报、设备 `on` / `off` 开关机（协议已标注整体废弃）
+- 首页多用户计数的"停止快速上传"（协议已标注作废）
 
 ---
 
-## 十、已知限制 & 演进方向
+## 十一、未实现 / 与协议冲突 / 语义不明
 
-| 方向 | 现状 | 建议 |
+### 11.1 未实现
+
+| 项 | 协议章节 | 说明 |
 |---|---|---|
-| 主站轮询块合并 | 按 (dev_id, reg_type) 合并连续 s_addr | FC03/04 最多 125 个寄存器，FC01/02 最多 2000 个 bit，当前实现已处理 |
-| u1 锁超时 | 800ms（`shared.LOCK_TIMEOUT_MS`） | 多通道同时写穿透时可能不够，观察后调至 2000-3000ms |
-| OTA 流水线 | `_extra/pre_version/src_user/user_ota.lua` 保留代码，未接入 | 建议用 `libfota2`（仓库有 demo），HTTP 下载 + CRC32 + fota 核心库 |
-| 网络看门狗 | `net_watchdog.lua` 已实现但 main.lua 注释掉 | 联调稳定后启用 |
-| 下行协议分发 | receiver.lua 当前只打印，不解析 | 按 `cmd == "ota"` / `cmd == "write"` 分支扩展 |
-| 固件版本标识 | main.lua 里 `VERSION = "666888"` 硬编码 | 接入 OTA 后从 `rtos.version()` 或上报里自动带出 |
+| `his` 历史召回 | 2.6 | 需要本地历史存储子系统 + `/dh` 数组版 payload（元素带 `ta`）；当前 `down.lua` 的 his handler 只打日志 |
+| 断点续传 `/dr` | 2.1.1 注 | 断网期间 real 数据补传，需要历史缓存 + 发送进度持久化 |
+| `sti` 预约生效 | 2.5 / 2.7 | indexReal、ctr 的 `sti`（开始时间）都没实现，当前一律"收到即生效" |
+| 多寄存器点位 set | 2.4 | `reg_count > 1` 的点不支持 `set`，直接进 `fail` |
+| OTA 升级 | 无 | 协议未定义报文；`_extra/pre_version/src_user/user_ota.lua` 是实测可用的旧实现 |
+| 网关参数远程配置 | 无 | 协议未定义报文；当前只有 `config.factory_reset()` 本地接口 |
+
+### 11.2 与协议冲突（需修正）
+
+| # | 问题 | 协议原文 | 当前实现 |
+|---|---|---|---|
+| 1 | ctr 的 `du > 1800` 被拒绝执行 | 2.7 只写"`-1` 永远，正常时间单位秒"，**没有 1800 限制**（该限制只出现在 2.5 indexReal / 2.6 his） | `report.apply_ctr` 直接回 `fail` 不执行 → 应去掉 |
+| 2 | indexReal 的 `iv` 被 clamp 到 1~60 秒 | 2.5 未限定 `iv` 上限 | `start_index_real` 里 `if iv_sec > 60 then iv_sec = 60` |
+| 3 | setack 未带回当前值 | 2.4 上行示例里同时带 `tag1:{q,t,v}`（文档自己也标"暂时不确定"） | 只回 `r` + `mid` |
+| 4 | 写入后不补 `real` | 2.4 注：iot 收到 setack 不会改实时数据，**需要控制器再发一条格式与 2.1.1 相同（real）的上报** | 写完更新缓存，只等下一轮 `change` 上报，`type` 是 change 不是 real |
+| 5 | `fail` 语义被扩大 | 2.4 中 `fail` 指"设置失败（如设备断电）" | 代码还把"点位不可写 `rw~="rw"` / 多寄存器 / 值非数字"都归入 `fail` |
+| 6 | real 间隔可配 | 2.1.1 要求"必须整 5 分钟" | 按 `config.upload_interval_min` 对齐，改非 5 就违反协议 |
+
+### 11.3 语义不明（需与服务端确认）
+
+| # | 问题 | 现状 |
+|---|---|---|
+| 1 | `iv` 单位是毫秒还是秒 | 协议正文写毫秒，但示例都是 `"5"`；代码按秒（`IV_IS_SECOND = true`） |
+| 2 | 设备 id 命名规则 | 协议示例是 `C1_D1`，点表 `dev_id` 是从机地址数字（`1`/`2`）；`down.lua` 用 `tonumber` 归一化，`"C1_D1"` 这类字符串会查不到点表 |
+| 3 | tag 命名规则 | 协议示例是 `tag1`/`tag2`，实际点表是 `something1`/`机组状态`；若服务端固定发 `tagN`，需要加 `num ↔ tag` 映射 |
+| 4 | `change` 的 `ti`/`t` 是否也要整点 | 协议只要求 real 整点；当前 change 用当前时间 |
+| 5 | ctr 的 `sti` 是否真的会下发 | 不下发则无需实现预约逻辑 |
+| 6 | ctr 与 indexReal 同时命中同一点位谁优先 | 当前互不干扰：indexReal 决定上报周期，ctr 决定开关与 change 节流 |
+| 7 | `ctr` 的 `iv` 是否只作用于 change | 当前 real 仍按整点全量上报，`iv` 只节流 change |
+
+### 11.4 工程风险（非协议问题）
+
+| # | 风险 | 说明 |
+|---|---|---|
+| 1 | 时间未同步时静默不上报 | `os.time() < 1600000000` 时 real / change / realIndex 全部跳过，只每 30s 打一条告警；现场长期无网会被平台判"设备离线" |
+| 2 | set 逐点写 | 一条 set 里 N 个点位 = N 次 Modbus 往返，且每个点位单独抢锁，可能被主站轮询插队 |
+| 3 | sender 队列 64 条封顶 | 队列满时丢最旧一条（`MAX_QUEUE = 64`），长时间断网可能丢掉 Real 数据 |
+| 4 | u1 锁超时 800ms | 多通道同时写穿透时可能偏紧，观察后考虑调大 |
 
 ---
 
-## 十一、常用速查
+## 十二、常用速查
 
 | 操作 | 改哪里 |
 |---|---|
-| 换 broker / 改 topic / 改 ClientID 前缀 | `wireless/mqtt/basic.lua` 顶部部署参数 |
+| 换 broker / 改 ClientID 前缀 | `wireless/mqtt/basic.lua` 顶部部署参数 |
+| 改上行周期 / 变化检测周期 / 写穿透开关 | `data/config.lua` → `DEFAULT_CFG` |
+| 恢复出厂配置 | 删 `/gateway_cfg.json` 后重启，或调 `config.factory_reset()` |
 | 加从机地址 | `modbus/point_table.lua` → `meta.slave_dev` |
 | 加寄存器点位 | `modbus/point_table.lua` → `regs` 表 |
 | 改 u1/u2 串口参数 / 方向控制脚 | `modbus/hardware.lua` → `u1_port` / `u2_port` 配置区 |
+| 改 topic 模板 | `wireless/mqtt/protocol/topics.lua` |
+| 改上报内容 / 策略 | `wireless/mqtt/protocol/report.lua` |
+| 加新的下行 type | `wireless/mqtt/protocol/down.lua` → `TOPIC_HANDLERS` 对应表加一行 |
 | 改喂狗引脚 / 间隔 | `device/ext_wdt.lua` 顶部 `EXT_WDT_PIN` / `EXT_WDT_FEED_INTERVAL_MS` |
-| 启用/停用网络看门狗 | `main.lua` 注释切换 |
 | 换 SIM 通道 / DNS | `wireless/4g/net_4g.lua` |
 | 调主站轮询间隔 | `modbus/master.lua` → `POLL_INTERVAL_MS` |
 
 ---
 
-## 十二、官方支持渠道
+## 十三、官方支持渠道
 
 | 资源 | 地址 |
 |---|---|
