@@ -20,6 +20,9 @@ require "ext_wdt"
 -- 4G 蜂窝网络管理：SIM 通道 / SIM/IP 状态 / DNS / ICCID
 require "net_4g"
 
+-- NTP 网络对时：IP_READY 后同步系统时钟，供 MQTT 上行 ti/t 使用
+require "sntp"
+
 -- 网络看门狗：5 分钟无网络活动自动重启（默认未启用，需要时取消注释）
 -- require "net_watchdog"
 

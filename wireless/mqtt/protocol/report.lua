@@ -33,6 +33,28 @@ local report = {}
 -- 外部唤醒事件：indexReal 指令到达时 publish 一下，让 task 立刻重算等待时间
 local WAKE_TOPIC = "MQTT_REPORT_WAKE"
 
+-- ============================================================
+-- 时间有效性门限
+-- 上电后系统时钟未被 NITZ/NTP 校准前，os.time() 停在 2000-01-01，
+-- 此时按整点对齐会算出 2000-01-01 08:05:00 这种假时间戳上报，必须先拦住。
+-- 1600000000 ≈ 2020-09-13 12:26:40 UTC
+-- ============================================================
+local TIME_VALID_MIN = 1600000000
+local last_time_warn = -1000
+
+local function time_ok(tag)
+    local now = os.time()
+    if now >= TIME_VALID_MIN then return true end
+
+    -- 每 30 秒最多提示一次，避免刷屏
+    if now - last_time_warn >= 30 then
+        last_time_warn = now
+        log.warn("mqtt.report", "系统时间未同步，暂不上报", tag,
+                 os.date("%Y-%m-%d %H:%M:%S", now))
+    end
+    return false
+end
+
 -- indexReal 里 iv 的单位：协议正文写"毫秒"，但示例 iv:"5" 且需求是"5秒一上送"
 -- 这里按秒解释；若服务端确实下发毫秒值，把这里改成 false
 local IV_IS_SECOND = true
@@ -145,6 +167,7 @@ end
 -- ============================================================
 local function send_real(boundary_ts)
     if not store_ready() then return end
+    if not time_ok("real") then return end
 
     local d = build_data(nil, boundary_ts)
     if not has_any(d) then return end
@@ -156,6 +179,7 @@ end
 
 local function send_change()
     if not store_ready() then return end
+    if not time_ok("change") then return end
 
     local d, any = diff_data()
     if not any then return end
@@ -166,6 +190,7 @@ end
 
 local function send_fast()
     if not store_ready() then return end
+    if not time_ok("realIndex") then return end
 
     local d = build_data(fast.targets, nil)
     if not has_any(d) then return end
@@ -183,6 +208,7 @@ function report.start_index_real(msg)
         log.warn("mqtt.report", "indexReal store 未就绪")
         return
     end
+    if not time_ok("indexReal") then return end
 
     local du = tonumber(msg.du)
     local iv = tonumber(msg.iv) or 5
@@ -266,6 +292,12 @@ local function report_task()
     commit_snapshot()
 
     local last_change_check = os.time()
+    -- 最近一次已处理的整点（unix 秒）。必须基于当前时钟计算，不能预存未来时间点：
+    -- NTP 校时会把时钟从 2000 年瞬间跳到 2026 年，任何"校准前算好的 boundary"
+    -- 都会变成过期值，醒来后 now >= boundary 恒成立，导致用 2000 年的时间戳上报。
+    local init_period = (tonumber(config.get("upload_interval_min")) or 5) * 60
+    if init_period < 60 then init_period = 60 end
+    local last_real_ts = os.time() - (os.time() % init_period)
 
     while true do
         local now = os.time()
@@ -278,13 +310,13 @@ local function report_task()
         if change_sec < 1 then change_sec = 1 end
 
         -- 下一个整点（对齐到 period 的整数倍）
-        local boundary = now - (now % period) + period
+        local next_boundary = now - (now % period) + period
         -- 下一次变化检测
         local next_change = last_change_check + change_sec
         -- 下一次快速上报
         local next_fast = fast.active and fast.next_send or nil
 
-        local wake_at = boundary
+        local wake_at = next_boundary
         if next_change < wake_at then wake_at = next_change end
         if next_fast and next_fast < wake_at then wake_at = next_fast end
 
@@ -294,7 +326,34 @@ local function report_task()
         -- 被 indexReal 指令唤醒时会提前返回，下一轮重新计算
         sys.waitUntil(WAKE_TOPIC, wait_ms)
 
+        -- 醒来后用当前时钟重新算整点，绝不使用睡前的值
         now = os.time()
+        local cur_boundary = now - (now % period)
+
+        -- 时钟回退（少见）：重置基准，等下一个整点
+        if cur_boundary < last_real_ts then
+            log.warn("mqtt.report", "检测到时钟回退，重置整点基准",
+                     os.date("%Y-%m-%d %H:%M:%S", now))
+            last_real_ts = cur_boundary
+        end
+
+        -- 整点全量上报（优先执行，避免和 change 在同一秒重复上报）
+        local did_real = false
+        if cur_boundary > last_real_ts then
+            local gap = cur_boundary - last_real_ts
+            last_real_ts = cur_boundary
+
+            if gap <= period * 2 then
+                -- 正常跨过一个周期
+                send_real(cur_boundary)
+                did_real = true
+            else
+                -- 时钟跳变（例如 NTP 校准跨年）：只重新对齐，不发这条假整点
+                log.warn("mqtt.report", "时钟跳变，跳过本次整点上报",
+                         "gap=" .. gap .. "s",
+                         "new_boundary=" .. os.date("%Y-%m-%d %H:%M:%S", cur_boundary))
+            end
+        end
 
         -- 快速上报
         if fast.active then
@@ -306,13 +365,6 @@ local function report_task()
                 fast.active = false
                 log.info("mqtt.report", "indexReal 到期，恢复常规上报")
             end
-        end
-
-        -- 整点全量上报（优先执行，避免和 change 在同一秒重复上报）
-        local did_real = false
-        if now >= boundary then
-            send_real(boundary)
-            did_real = true
         end
 
         -- 变化上报
