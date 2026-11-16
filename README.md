@@ -29,6 +29,7 @@
 | 8 | 协议分层 | topic / 上行拼装 / ack 拼装 / 下行解析 / 上报调度各自一个文件 |
 | 9 | 配置持久化 | `data/config.lua` 存 `/gateway_cfg.json`，OTA 新增字段自动 fallback 默认值 |
 | 10 | 时间可信 | NITZ 基站校时 + `socket.sntp()`，时间未同步前拒绝上报假时间戳 |
+| 11 | 网关参数远程配置 | `/s2` `/d2` 复用 set/call 结构，改 `config` 并落盘，`sys_need_reboot` 提示待重启 |
 
 ---
 
@@ -63,10 +64,11 @@ D700Tm_3RS485/
 │       ├── sender.lua               上行发送队列：串行 / 断线保留 / PUBLISH_OK 推进
 │       ├── receiver.lua             下行入队：task 内批量取空 → down.dispatch
 │       └── protocol/                MQTT 协议层
-│           ├── topics.lua           topic 常量表（/s、/scr、/d、/dh、/dr、/dcr）+ SUB_TABLE
+│           ├── topics.lua           topic 常量表（/s、/scr、/s2、/d、/dh、/dr、/dcr、/d2）+ SUB_TABLE
 │           ├── up.lua               上行 payload 拼装（with_time / without_time）
 │           ├── ack.lua              应答 payload 拼装（setack / indexRealAck / hisAck）
 │           ├── down.lua             下行解析 + 按 topic/type 分发（唯一入口 dispatch）
+│           ├── cfg.lua              网关自身参数：注册表 + call/set + 参数变化 change
 │           └── report.lua           上行调度：real / change / realIndex
 │
 ├── _extra/                          OpenLuat 官方 demo 库（gitignore，仅作 API 参考）
@@ -93,8 +95,9 @@ main.lua
  └── basic          → sender + receiver + topics
                        receiver → down
                          down   → topics + store + core + hardware + downlink_uart_lock
-                                  + up + ack + sender + report
+                                  + up + ack + sender + report + cfg
                          report → topics + store + up + ack + sender + config
+                         cfg    → config + up + sender + topics
                        sender  ←  basic（connect 时把 mqtt_client 交给它）
 ```
 
@@ -212,7 +215,7 @@ I/user.mqtt.main ======= 部署参数 =======
 I/user.mqtt.main SERVER       = broker.emqx.io:1883
 I/user.mqtt.main UID          = 03230619179356C9
 I/user.mqtt.main CLIENT_ID    = YEDtest_D700Tm_mqtt_03230619179356C9
-I/user.mqtt.main SUB_TOPICS   = {"/scr/03230619179356C9":0,"/s/03230619179356C9":0}
+I/user.mqtt.main SUB_TOPICS   = {"/s/03230619179356C9":0,"/s2/03230619179356C9":0,"/scr/03230619179356C9":0}
 I/user.mqtt.main USERNAME     = (空)
 I/user.mqtt.main PASSWORD     = (空)
 I/user.mqtt.main CLEAN_SESSION= true KEEPALIVE= 60s
@@ -223,7 +226,7 @@ I/user.mqtt.main ========================
 |---|---|
 | `UID` | `mcu.unique_id():toHex()`，8 字节硬件 UID（16 个 hex 字符），每颗模组不同 |
 | `CLIENT_ID` | MQTT ClientID，broker 靠它区分设备；格式 `YEDtest_D700Tm_mqtt_<UID>` |
-| `SUB_TOPICS` | 内容全部来自 `topics.SUB_TABLE`，当前为 `/s/${sn}` + `/scr/${sn}` |
+| `SUB_TOPICS` | 内容全部来自 `topics.SUB_TABLE`，当前为 `/s/${sn}` + `/scr/${sn}` + `/s2/${sn}` |
 | `sn` | 协议里的网关号，等于 UID |
 | `KEEPALIVE_SEC` | 心跳 60s，小于网络看门狗一半 |
 | `RECONNECT_DELAY_MIN/MAX` | 重连退避 5s 起步，翻倍至 30s 封顶 |
@@ -238,7 +241,9 @@ I/user.mqtt.main ========================
 |---|---|---|---|
 | 下行 | `/s/${sn}` | call / set | 已实现 |
 | 下行 | `/scr/${sn}` | indexReal / ctr / his | indexReal 已实现；ctr、his 未实现 |
+| 下行 | `/s2/${sn}` | 网关自身参数：call / set | 已实现（自定义扩展，见 7.6） |
 | 上行 | `/d/${sn}` | real / change / realIndex / callack / setack | 已实现 |
+| 上行 | `/d2/${sn}` | 网关自身参数：callack / setack / change | 已实现（自定义扩展，见 7.6） |
 | 上行 | `/dcr/${sn}` | indexRealAck / ctrAck / hisAck | indexRealAck 已实现；其余未实现 |
 | 上行 | `/dh/${sn}` | 历史数据（数组版 payload） | 未实现 |
 | 上行 | `/dr/${sn}` | 断点续传（payload 与 `/d/` 相同） | 未实现 |
@@ -318,6 +323,81 @@ I/user.mqtt.main ========================
 
 > 如果服务端以后改成"合并更新"语义，只需在 `send_real_after_set` 里把 `build_data(nil, nil)` 的第一个参数换成 `{ [dev_id] = { [tag] = true } }` 过滤表，其他逻辑不用动。
 
+### 7.6 网关自身参数（`/s2` `/d2`，自定义扩展）
+
+协议原文只有"采集点控制"（2.7），没有"网关自身参数读写"。这里按**不改协议结构、只换 topic** 的思路扩展：把网关自己当作一台虚拟设备，设备 id = 芯片 UID（`sn`），tag = 参数名，完全复用 `set` / `call` 的报文结构，服务端不需要新类型。
+
+**改参数**
+
+```json
+// 下行 /s2/03230619179356C9 —— 一次改多个参数
+{"t":"set","d":{"03230619179356C9":{"u1_baudrate":"19200","upload_interval_min":"10","mid":11}}}
+
+// 上行 /d2/03230619179356C9 —— setack
+{"t":"setack","d":{"03230619179356C9":{"mid":11,"r":{"success":"all"}}}}
+
+// 上行 /d2/03230619179356C9 —— 参数变化 change（只含真正变了的 tag）
+{"t":"change","ti":"2026-11-16 13:23:50","d":{"03230619179356C9":{
+  "u1_baudrate":{"q":"1","t":"1794806630","v":"19200"},
+  "sys_need_reboot":{"q":"1","t":"1794806630","v":"1"}}}}
+```
+
+**读参数 / 读状态**
+
+```json
+// 下行 /s2/03230619179356C9（ts 省略 = 读全部）
+{"t":"call","d":{"03230619179356C9":{"ts":["u1_baudrate","sys_need_reboot"],"mid":58}}}
+// 上行 /d2/03230619179356C9
+{"t":"callack","ti":"2026-11-16 13:24:39","d":{"03230619179356C9":{
+  "u1_baudrate":{"q":"1","t":"1794806630","v":"19200"},
+  "sys_need_reboot":{"q":"1","t":"1794806679","v":"1"},
+  "mid":58}}}
+```
+
+**行为约定**
+
+| 项 | 约定 |
+|---|---|
+| 设备 id | 必须等于本机 `sn`（UID）；不匹配只打日志、不回包 |
+| 值类型 | 下行字符串或裸数字都接受（`tonumber` 兜底）；上行一律字符串，bool 用 `"1"`/`"0"` |
+| 多参数 | 与设备 set 一致：多个 tag 平铺、**逐项独立**，失败项进 `fail`/`not_found`，成功项照写 |
+| 定时上报 | **无**：网关自身不做整点 real，也不参与 7.5 的 set 后 real 补发 |
+| 变化上报 | 参数写入成功且值真的变了才发 `change`；`sys_need_reboot` 由 0 翻 1 时一并带上 |
+| 持久化 | 写入即落盘 `/gateway_cfg.json`，断电重启后保持 |
+| 生效时机 | 串口类参数需重启；上报周期类下一轮生效（见下表） |
+| 参数 `t` | 最后一次写入时间；从未写过则取本次启动时间 |
+| 失败判定 | 值非法/类型不符 → `fail`；只读项被写 → `fail`；未知 tag → `not_found` |
+
+**参数注册表**（`protocol/cfg.lua` → `REG`）
+
+| key | 类型 | 范围 | 需重启 |
+|---|---|---|---|
+| `u1_baudrate` / `u2_baudrate` | number | 1200~115200 | 是 |
+| `u1_databits` / `u2_databits` | number | 5~8 | 是 |
+| `u1_stopbits` / `u2_stopbits` | number | 1~2 | 是 |
+| `u1_parity` / `u2_parity` | string | N / E / O | 是 |
+| `upload_interval_min` | number | 1~60 | 否 |
+| `change_check_sec` | number | 1~60 | 否 |
+| `write_through_en` | bool | `"1"`/`"0"` | 否 |
+
+**只读状态**
+
+| key | 说明 |
+|---|---|
+| `model` / `fw` / `sn` | 型号 / 固件版本 / UID |
+| `imei` / `iccid` / `csq` / `ip` | 4G 信息 |
+| `uptime_s` | 本次运行秒数 |
+| `sys_need_reboot` | `"1"` = 有参数已保存、但需重启才生效 |
+| `sys_last_error` | 最近一次 set 失败原因：`invalid_value` / `readonly` / `flash_fail` |
+
+> **`requires_reboot` 与 `sys_need_reboot` 不要混用**
+> `requires_reboot` 是注册表内部字段（`u1_baudrate = { requires_reboot = true }`），只决定"这类参数改完要不要重启"；`sys_need_reboot` 是唯一对外的只读 tag。读 `need_reboot` 会命中"未知参数"，返回 `{"q":"0","v":"0"}` 并打 warn。
+>
+> **`sys_last_error` 的语义**
+> 只保留最近一次失败原因、不落盘、不主动上报，只能 call 读；未知 tag 的 `not_found` 不更新它。混合 set 中多个失败项时，最终记哪一条取决于 `pairs` 遍历顺序（不确定），但 `setack` 的 `fail` 数组已完整列出所有失败 tag。
+>
+> **重启策略**：写串口参数只落盘、**不自动重启**；由平台看到 `sys_need_reboot="1"` 后人工确认，再发重启动作（`sys_action` 尚未实现，见 11.1）。这样避免串口参数写错导致重启后失联。
+
 ---
 
 ## 八、硬件接线
@@ -386,14 +466,17 @@ I/user.mqtt.main ========================
 | 11 | 上行 realIndex（首页快速上传） | `report.start_index_real` | 已联调 |
 | 12 | 下行 call（查缓存） | `protocol/down.lua` | 已联调 |
 | 13 | 下行 set（多设备多属性写穿透） | `protocol/down.lua` | 已联调 |
-| 14 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
+| 14 | 网关自身参数读（`/s2` call → `/d2` callack） | `protocol/cfg.lua` | 已联调 |
+| 15 | 网关自身参数写（`/s2` set → setack + 参数 change） | `protocol/cfg.lua` | 已联调 |
+| 16 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
 
 ### 10.2 本次范围外（明确不做）
 
 - `his` 历史召回 + `/dh` 上行
 - `ctr` 采集点控制（2.7）
 - 断点续传 `/dr`
-- OTA 升级、网关参数远程配置（协议未定义报文）
+- OTA 升级
+- `sys_action` 动作（`reboot` / `factoryReset` 远程触发）
 - `alarm` 报警上报、设备 `on` / `off` 开关机（协议已标注整体废弃）
 - 首页多用户计数的"停止快速上传"（协议已标注作废）
 
@@ -411,7 +494,7 @@ I/user.mqtt.main ========================
 | `sti` 预约生效 | 2.5 | indexReal 的 `sti`（开始时间）未实现，当前"收到即生效" |
 | 多寄存器点位 set | 2.4 | `reg_count > 1` 的点不支持 `set`，直接进 `fail` |
 | OTA 升级 | 无 | 协议未定义报文；`_extra/pre_version/src_user/user_ota.lua` 是实测可用的旧实现 |
-| 网关参数远程配置 | 无 | 协议未定义报文；当前只有 `config.factory_reset()` 本地接口 |
+| `sys_action` 动作 | 无 | 参数表里预留了 `sys_action` 语义（`reboot` / `factoryReset`），但 handler 未实现；当前重启只能断电 |
 
 ### 11.2 与协议冲突（需修正）
 
@@ -447,6 +530,8 @@ I/user.mqtt.main ========================
 |---|---|
 | 换 broker / 改 ClientID 前缀 | `wireless/mqtt/basic.lua` 顶部部署参数 |
 | 改上行周期 / 变化检测周期 / 写穿透开关 | `data/config.lua` → `DEFAULT_CFG` |
+| 改网关参数注册表（类型/范围/是否需重启） | `wireless/mqtt/protocol/cfg.lua` → `REG` |
+| 加网关只读状态项 | `wireless/mqtt/protocol/cfg.lua` → `status_get` + `READONLY` |
 | 恢复出厂配置 | 删 `/gateway_cfg.json` 后重启，或调 `config.factory_reset()` |
 | 加从机地址 | `modbus/point_table.lua` → `meta.slave_dev` |
 | 加寄存器点位 | `modbus/point_table.lua` → `regs` 表 |
