@@ -367,6 +367,27 @@ I/user.mqtt.main ========================
 | 生效时机 | 串口类参数需重启；上报周期类下一轮生效（见下表） |
 | 参数 `t` | 最后一次写入时间；从未写过则取本次启动时间 |
 | 失败判定 | 值非法/类型不符 → `fail`；只读项被写 → `fail`；未知 tag → `not_found` |
+| 动作 | `sys_action`：`"reboot"` / `"factoryReset"`，见下方说明 |
+
+**动作 `sys_action`**
+
+不是配置项：不落盘、不可读、不出现在 `PARAM_ORDER` 里，只能通过 `set` 触发。
+
+```json
+// 下行 /s2/03230619179356C9
+{"t":"set","d":{"03230619179356C9":{"sys_action":"reboot","mid":21}}}
+// 上行 /d2/... —— 先回 setack，500ms 后再重启
+{"t":"setack","d":{"03230619179356C9":{"mid":21,"r":{"success":"all"}}}}
+```
+
+| 取值 | 行为 |
+|---|---|
+| `reboot` | 回 setack 后 500ms 执行 `rtos.reboot()`，让落盘的串口参数生效 |
+| `factoryReset` | 回 setack 后 500ms 删除 `/gateway_cfg.json` 并重启，配置回到代码默认值 |
+| 其它值 | 进 `fail`，`sys_last_error = invalid_value`，不执行 |
+
+> 500ms 延迟是为了让 sender 先把 `setack` 发出去，避免"设备已经重启、平台没收到应答"。
+> 若此刻 MQTT 恰好断线，`setack` 会留在队列里随重启丢失——动作仍然执行。
 
 **参数注册表**（`protocol/cfg.lua` → `REG`）
 
@@ -396,7 +417,7 @@ I/user.mqtt.main ========================
 > **`sys_last_error` 的语义**
 > 只保留最近一次失败原因、不落盘、不主动上报，只能 call 读；未知 tag 的 `not_found` 不更新它。混合 set 中多个失败项时，最终记哪一条取决于 `pairs` 遍历顺序（不确定），但 `setack` 的 `fail` 数组已完整列出所有失败 tag。
 >
-> **重启策略**：写串口参数只落盘、**不自动重启**；由平台看到 `sys_need_reboot="1"` 后人工确认，再发重启动作（`sys_action` 尚未实现，见 11.1）。这样避免串口参数写错导致重启后失联。
+> **重启策略**：写串口参数只落盘、**不自动重启**；由平台看到 `sys_need_reboot="1"` 后人工确认，再下发 `{"sys_action":"reboot"}`。这样避免串口参数写错导致重启后失联。
 
 ---
 
@@ -468,7 +489,8 @@ I/user.mqtt.main ========================
 | 13 | 下行 set（多设备多属性写穿透） | `protocol/down.lua` | 已联调 |
 | 14 | 网关自身参数读（`/s2` call → `/d2` callack） | `protocol/cfg.lua` | 已联调 |
 | 15 | 网关自身参数写（`/s2` set → setack + 参数 change） | `protocol/cfg.lua` | 已联调 |
-| 16 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
+| 16 | 网关动作（`sys_action` = reboot / factoryReset） | `protocol/cfg.lua` | 已联调 |
+| 17 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
 
 ### 10.2 本次范围外（明确不做）
 
@@ -476,7 +498,6 @@ I/user.mqtt.main ========================
 - `ctr` 采集点控制（2.7）
 - 断点续传 `/dr`
 - OTA 升级
-- `sys_action` 动作（`reboot` / `factoryReset` 远程触发）
 - `alarm` 报警上报、设备 `on` / `off` 开关机（协议已标注整体废弃）
 - 首页多用户计数的"停止快速上传"（协议已标注作废）
 
@@ -494,7 +515,6 @@ I/user.mqtt.main ========================
 | `sti` 预约生效 | 2.5 | indexReal 的 `sti`（开始时间）未实现，当前"收到即生效" |
 | 多寄存器点位 set | 2.4 | `reg_count > 1` 的点不支持 `set`，直接进 `fail` |
 | OTA 升级 | 无 | 协议未定义报文；`_extra/pre_version/src_user/user_ota.lua` 是实测可用的旧实现 |
-| `sys_action` 动作 | 无 | 参数表里预留了 `sys_action` 语义（`reboot` / `factoryReset`），但 handler 未实现；当前重启只能断电 |
 
 ### 11.2 与协议冲突（需修正）
 
@@ -532,6 +552,7 @@ I/user.mqtt.main ========================
 | 改上行周期 / 变化检测周期 / 写穿透开关 | `data/config.lua` → `DEFAULT_CFG` |
 | 改网关参数注册表（类型/范围/是否需重启） | `wireless/mqtt/protocol/cfg.lua` → `REG` |
 | 加网关只读状态项 | `wireless/mqtt/protocol/cfg.lua` → `status_get` + `READONLY` |
+| 改可执行动作白名单 | `wireless/mqtt/protocol/cfg.lua` → `ACTIONS` + `on_set` 末尾 |
 | 恢复出厂配置 | 删 `/gateway_cfg.json` 后重启，或调 `config.factory_reset()` |
 | 加从机地址 | `modbus/point_table.lua` → `meta.slave_dev` |
 | 加寄存器点位 | `modbus/point_table.lua` → `regs` 表 |

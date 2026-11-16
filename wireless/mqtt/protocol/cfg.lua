@@ -183,6 +183,15 @@ function cfg.on_call(dev_key, body)
 end
 
 -- ============================================================
+-- 可执行动作：set 时只接受下列取值
+-- 动作不是配置项，不落盘、不可读，执行后通常伴随重启
+-- ============================================================
+local ACTIONS = {
+    reboot       = true,   -- 立即重启（让落盘的串口参数等生效）
+    factoryReset = true,   -- 删除 /gateway_cfg.json 后重启，恢复代码默认值
+}
+
+-- ============================================================
 -- 参数校验：返回 转换后的值, 错误码（错误码为 nil 表示通过）
 -- ============================================================
 local function validate(meta, raw)
@@ -218,9 +227,21 @@ function cfg.on_set(dev_key, body)
     local fail_tags = {}
     local not_found_tags = {}
     local reboot_before = pending_reboot
+    local action_req = nil       -- 待执行动作（reboot / factoryReset）
 
     for tag, raw in pairs(body) do
-        if tag ~= "mid" then
+        if tag == "sys_action" then
+            local act = tostring(raw)
+            if ACTIONS[act] then
+                action_req = act
+                log.info("mqtt.cfg", "set 动作受理", act)
+            else
+                fail_tags[#fail_tags + 1] = tag
+                last_error = "invalid_value"
+                log.warn("mqtt.cfg", "set 未知动作", act)
+            end
+
+        elseif tag ~= "mid" then
             local meta = REG[tag]
             if meta then
                 local val, code = validate(meta, raw)
@@ -287,6 +308,20 @@ function cfg.on_set(dev_key, body)
         local payload = up.with_time("change", os.date("%Y-%m-%d %H:%M:%S"), { [dev_key] = d })
         sender.publish(topics.UP_CFG, payload, 1)
         log.info("mqtt.cfg", "change 已发送", "count=" .. n)
+    end
+
+    -- 3. 动作放在最后执行：留 500ms 让 sender 把 setack 发出去，避免设备先重启、平台收不到应答
+    if action_req then
+        sys.taskInit(function()
+            sys.wait(500)
+            if action_req == "reboot" then
+                log.warn("mqtt.cfg", "执行动作 reboot")
+                rtos.reboot()
+            else
+                log.warn("mqtt.cfg", "执行动作 factoryReset")
+                config.factory_reset()   -- 内部 os.remove + rtos.reboot
+            end
+        end)
     end
 end
 
