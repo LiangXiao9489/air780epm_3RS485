@@ -282,6 +282,18 @@ local TOPIC_HANDLERS = {
                 end
             end)
         end,
+
+        set = function(msg)
+            sys.taskInit(function()
+                for dev_id, body in pairs(msg.d or {}) do
+                    if tostring(dev_id) == topics.SN then
+                        cfg.on_set(dev_id, body)
+                    else
+                        log.warn("mqtt.down", "cfg topic 设备号不是本机", dev_id, "sn=" .. topics.SN)
+                    end
+                end
+            end)
+        end,
     },
 }
 
