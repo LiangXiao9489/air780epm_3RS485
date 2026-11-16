@@ -190,18 +190,27 @@ end
 -- 返回：true 成功 / false + ack_fail_code + sys_error_code
 -- ============================================================
 local function download_or_reuse(url, crc, size)
-    -- 空间检查（LuatOS 上 io.fileFree 可能不存在，skip 时打印警告继续）
+    -- 空间检查：用 io.fsstat（demo 里的标准 API，返回 (ok, total_blk, used_blk, blk_size, fs_type)）
     local free
-    if io and type(io.fileFree) == "function" then
-        free = io.fileFree("/") or 0
-    else
-        log.warn("mqtt.ota", "io.fileFree 不可用，跳过空间检查")
-        free = math.huge
+    if io and type(io.fsstat) == "function" then
+        local ok, total, used, blk_size = io.fsstat("/")
+        if ok and total and used and blk_size then
+            free = (total - used) * blk_size
+        end
     end
-    -- 保守估算：剩余空间至少是固件 size 的 1.1 倍（留 10% 余量给头部+日志+ack）
-    if free < size + math.floor(size * 0.1) + 16384 then
+    if not free or free <= 0 then
+        log.warn("mqtt.ota", "io.fsstat 不可用或返回异常，跳过空间检查")
+        free = math.huge
+    else
+        log.info("mqtt.ota", "文件系统剩余空间", free, "字节")
+    end
+
+    -- 剩余空间 < 固件 size 的 10/9（即固件占了剩余空间的 90% 以上）就拒绝下载
+    -- 保证写完固件后还至少剩 10% 的余量（给 ack 日志 + 重启缓冲）
+    local needed = math.ceil(size / 0.9)
+    if free < needed then
         log.error("mqtt.ota", "文件系统空间不足",
-                  "剩余=" .. free, "需要≥" .. size + math.floor(size * 0.1) + 16384)
+                  "剩余=" .. free, "固件=" .. size, "需要≥" .. needed)
         set_error("ota_no_space")
         return false, "no_space", "ota_no_space"
     end
