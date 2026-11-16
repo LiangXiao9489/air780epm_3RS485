@@ -59,6 +59,8 @@ D700Tm_3RS485/
 │   │   ├── net_4g.lua               SIM 通道 / IMEI / DNS / IP_READY 监听
 │   │   └── sntp.lua                 NTP 校时（IP_READY 后同步，成功 1 小时一次，失败 10s 重试）
 │   │
+│   ├── ota.lua                      远程固件升级：HTTP 下载 + CRC32 校验 + fota 写入 + 自动重下
+│   │
 │   └── mqtt/
 │       ├── basic.lua                总调度：建链 / 订阅 / 事件分发 / 退避重连 / 部署参数打印
 │       ├── sender.lua               上行发送队列：串行 / 断线保留 / PUBLISH_OK 推进
@@ -241,9 +243,9 @@ I/user.mqtt.main ========================
 |---|---|---|---|
 | 下行 | `/s/${sn}` | call / set | 已实现 |
 | 下行 | `/scr/${sn}` | indexReal / ctr / his | indexReal 已实现；ctr、his 未实现 |
-| 下行 | `/s2/${sn}` | 网关自身参数：call / set | 已实现（自定义扩展，见 7.6） |
+| 下行 | `/s2/${sn}` | 网关自身参数 call/set + OTA（`t=ota`） | 已实现（自定义扩展，见 7.6 / 7.7） |
 | 上行 | `/d/${sn}` | real / change / realIndex / callack / setack | 已实现 |
-| 上行 | `/d2/${sn}` | 网关自身参数：callack / setack / change | 已实现（自定义扩展，见 7.6） |
+| 上行 | `/d2/${sn}` | 网关自身参数 callack/setack/change + OTA ack | 已实现（自定义扩展，见 7.6 / 7.7） |
 | 上行 | `/dcr/${sn}` | indexRealAck / ctrAck / hisAck | indexRealAck 已实现；其余未实现 |
 | 上行 | `/dh/${sn}` | 历史数据（数组版 payload） | 未实现 |
 | 上行 | `/dr/${sn}` | 断点续传（payload 与 `/d/` 相同） | 未实现 |
@@ -419,6 +421,61 @@ I/user.mqtt.main ========================
 >
 > **重启策略**：写串口参数只落盘、**不自动重启**；由平台看到 `sys_need_reboot="1"` 后人工确认，再下发 `{"sys_action":"reboot"}`。这样避免串口参数写错导致重启后失联。
 
+### 7.7 OTA 远程固件升级（`/s2` `/d2`，自定义扩展）
+
+协议未定义 OTA 报文。复用 `/s2`（下行）和 `/d2`（上行），用 `t="ota"` 区分。
+
+**下行**
+```json
+// 下行 /s2/${sn}
+{"t":"ota","d":{"${sn}":{"url":"http://x/fw.bin","crc":"48D16E8F","size":"13766","mid":51}}}
+```
+
+必须且只能三个字段（`url` / `crc` / `size`），多一个少一个都回 `param` 错误。支持两种 CRC 写法：
+- 十进制字符串：`"2339340852"`
+- 十六进制：`"0x48D16E8F"` 或 `"48D16E8F"`
+
+**上行**
+```json
+// 下载完成 /d2/${sn}
+{"t":"otaDownloadAck","d":{"${sn}":{"r":{"success":"all"},"mid":51}}}
+
+// 校验完成 /d2/${sn}
+{"t":"otaVerifyAck","d":{"${sn}":{"r":{"success":"all"},"mid":51}}}
+```
+
+全部成功后：两阶段 ack → 等 500ms（让 ack 发出去）→ `fota` 写入 → 等 2000ms → 自动重启。重启后靠新 `fw` 版本号确认升级成功。
+
+**失败路径**（`r.fail` 数组 + `sys_last_error`）
+
+| `fail` | `sys_last_error` | 说明 |
+|---|---|---|
+| `param` | `ota_param` | url/crc/size 缺失、多余、或类型非法 |
+| `no_space` | `ota_no_space` | 剩余空间 < 固件 size × 10/9（固件占了剩余 90% 以上） |
+| `download` | `ota_http_404` / `ota_http_500` / `ota_timeout` | HTTP 下载失败 |
+| `verify` | `ota_size_mismatch` / `ota_crc_mismatch` | 下载 size 与声明不符、CRC 校验失败（自动重下 1 次后仍失败） |
+| `busy` | `ota_busy` | 升级过程中收到新的 `t=ota` 或 `sys_action` |
+| - | `ota_flash_write` | `fota` 写入失败（不重启、固件文件保留、可重发指令） |
+
+**锁与隔离**
+
+- OTA 期间 `sys_action`（reboot / factoryReset）被拦截，回 `busy`，避免升级中断
+- 升级期间新的 `t=ota` 被拦截，回 `busy`
+- **不**暂停 Modbus 主从站（HTTP 下载与 485 轮询不抢资源）
+- 整个流程用 `pcall` 兜底，任何未知错误 → 打日志 → 回 `internal` ack → `busy` 清零 → 设备不重启
+
+**固件路径与分区**
+
+- 下载到 `/Air780EPM_3RS485_Refactor_upgrade.bin`（`PROJECT` 变量，改工程名自动跟着改）
+- 文件系统约 168KB，OTA 固件必须 ≤ 120KB（留剩余 ≥ 10%）
+- 升级完成 / 失败都会清理残留文件
+
+**实现落点**
+
+- `wireless/ota.lua`：完整流程
+- `protocol/down.lua`：`/s2` 路由 `t=ota` → `ota.handle()`
+- `protocol/cfg.lua`：`sys_action` 在 `busy` 时被拦截
+
 ---
 
 ## 八、硬件接线
@@ -453,6 +510,7 @@ I/user.mqtt.main ========================
 ├── data/                               ← 2 个文件（store / config）
 ├── device/                             ← 1 个文件（ext_wdt）
 ├── wireless/4g/                        ← 2 个文件（net_4g / sntp）
+├── wireless/                           ← ota.lua 直接放 wireless/ 根目录
 └── wireless/mqtt/                      ← 3 个文件（basic / sender / receiver）
     └── protocol/                       ← 5 个文件（topics / up / ack / down / report）
 ```
@@ -490,16 +548,18 @@ I/user.mqtt.main ========================
 | 14 | 网关自身参数读（`/s2` call → `/d2` callack） | `protocol/cfg.lua` | 已联调 |
 | 15 | 网关自身参数写（`/s2` set → setack + 参数 change） | `protocol/cfg.lua` | 已联调 |
 | 16 | 网关动作（`sys_action` = reboot / factoryReset） | `protocol/cfg.lua` | 已联调 |
-| 17 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
+| 17 | OTA 远程固件升级（参数校验 → 空间检查 → HTTP 下载 → CRC32 → fota 写入 → 重启） | `wireless/ota.lua` | 已联调 |
+| 18 | set 成功后补发全量 real | `protocol/report.lua` | 已联调 |
+| 19 | 外部看门狗 | `device/ext_wdt.lua` | 已启用 |
 
 ### 10.2 本次范围外（明确不做）
 
 - `his` 历史召回 + `/dh` 上行
 - `ctr` 采集点控制（2.7）
 - 断点续传 `/dr`
-- OTA 升级
 - `alarm` 报警上报、设备 `on` / `off` 开关机（协议已标注整体废弃）
 - 首页多用户计数的"停止快速上传"（协议已标注作废）
+- `sys_token` / 鉴权（当前依赖 broker 侧 ACL，无内置校验）
 
 ---
 
@@ -514,7 +574,6 @@ I/user.mqtt.main ========================
 | 断点续传 `/dr` | 2.1.1 注 | 断网期间 real 数据补传，需要历史缓存 + 发送进度持久化 |
 | `sti` 预约生效 | 2.5 | indexReal 的 `sti`（开始时间）未实现，当前"收到即生效" |
 | 多寄存器点位 set | 2.4 | `reg_count > 1` 的点不支持 `set`，直接进 `fail` |
-| OTA 升级 | 无 | 协议未定义报文；`_extra/pre_version/src_user/user_ota.lua` 是实测可用的旧实现 |
 
 ### 11.2 与协议冲突（需修正）
 
@@ -523,6 +582,7 @@ I/user.mqtt.main ========================
 | 1 | setack 未带回当前值 | 2.4 上行示例里同时带 `tag1:{q,t,v}`（文档自己也标"暂时不确定"） | 只回 `r` + `mid` |
 | 2 | `fail` 语义被扩大 | 2.4 中 `fail` 指"设置失败（如设备断电）" | 代码还把"点位不可写 `rw~="rw"` / 多寄存器 / 值非数字"都归入 `fail` |
 | 3 | real 间隔可配 | 2.1.1 要求"必须整 5 分钟" | 按 `config.upload_interval_min` 对齐，改非 5 就违反协议 |
+| 4 | callack 带 `ti` | 2.3 上行示例只有 `t` + `d`，**没有 `ti`** | 走 `up.with_time()` 自动附带 `ti`；`setack` 走 `ack.build()` 不带 `ti`，与协议一致 |
 
 ### 11.3 语义不明（需与服务端确认）
 
@@ -532,6 +592,7 @@ I/user.mqtt.main ========================
 | 2 | 设备 id 命名规则 | 协议示例是 `C1_D1`，点表 `dev_id` 是从机地址数字（`1`/`2`）；`down.lua` 用 `tonumber` 归一化，`"C1_D1"` 这类字符串会查不到点表 |
 | 3 | tag 命名规则 | 协议示例是 `tag1`/`tag2`，实际点表是 `something1`/`机组状态`；若服务端固定发 `tagN`，需要加 `num ↔ tag` 映射 |
 | 4 | `change` 的 `ti`/`t` 是否也要整点 | 协议只要求 real 整点；当前 change 用当前时间 |
+| 5 | OTA 的 CRC 32 进制还是十进制 | 代码同时支持：十进制 `"2339340852"` / `0x` 前缀 `"0x48D16E8F"` / 纯十六进制 `"48D16E8F"`；建议平台固定一种（推荐十进制） |
 
 ### 11.4 工程风险（非协议问题）
 
