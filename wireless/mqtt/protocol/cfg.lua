@@ -11,7 +11,7 @@
 
 当前进度：
   已实现  call —— 读参数 + 读状态（含 sys_need_reboot / sys_last_error）
-  已实现  set  —— 改参数 + 落盘 + setack + change 上报 + need_reboot 标记
+  已实现  set  —— 改参数 + 落盘 + setack + change 上报 + sys_need_reboot 标记
   未实现  动作 —— sys_action（reboot / factoryReset）
 
 参数 key 规范：
@@ -34,18 +34,18 @@ local cfg = {}
 -- type          number / string / bool
 -- min / max     仅 number 有效
 -- enum          仅 string 有效
--- need_reboot   写入后必须重启才生效
+-- requires_reboot  写入后必须重启才生效（内部元数据，不是可读 tag）
 -- ============================================================
 local REG = {
-    u1_baudrate = { type = "number", min = 1200,  max = 115200, need_reboot = true },
-    u1_databits = { type = "number", min = 5,     max = 8,      need_reboot = true },
-    u1_stopbits = { type = "number", min = 1,     max = 2,      need_reboot = true },
-    u1_parity   = { type = "string", enum = { N = true, E = true, O = true }, need_reboot = true },
+    u1_baudrate = { type = "number", min = 1200,  max = 115200, requires_reboot = true },
+    u1_databits = { type = "number", min = 5,     max = 8,      requires_reboot = true },
+    u1_stopbits = { type = "number", min = 1,     max = 2,      requires_reboot = true },
+    u1_parity   = { type = "string", enum = { N = true, E = true, O = true }, requires_reboot = true },
 
-    u2_baudrate = { type = "number", min = 1200,  max = 115200, need_reboot = true },
-    u2_databits = { type = "number", min = 5,     max = 8,      need_reboot = true },
-    u2_stopbits = { type = "number", min = 1,     max = 2,      need_reboot = true },
-    u2_parity   = { type = "string", enum = { N = true, E = true, O = true }, need_reboot = true },
+    u2_baudrate = { type = "number", min = 1200,  max = 115200, requires_reboot = true },
+    u2_databits = { type = "number", min = 5,     max = 8,      requires_reboot = true },
+    u2_stopbits = { type = "number", min = 1,     max = 2,      requires_reboot = true },
+    u2_parity   = { type = "string", enum = { N = true, E = true, O = true }, requires_reboot = true },
 
     upload_interval_min = { type = "number", min = 1,  max = 60 },
     change_check_sec    = { type = "number", min = 1,  max = 60 },
@@ -84,7 +84,7 @@ local boot_ts = os.time()
 local mtime = {}
 
 -- 有待重启生效的参数（重启后自然清零）
-local need_reboot_flag = false
+local pending_reboot = false
 -- 最近一次失败原因（readonly / invalid_value / flash_fail）
 local last_error = ""
 
@@ -119,7 +119,7 @@ local function status_get(key)
     elseif key == "uptime_s" then
         return tostring(math.floor((mcu.ticks and mcu.ticks() or 0) / 1000))
     elseif key == "sys_need_reboot" then
-        return need_reboot_flag and "1" or "0"
+        return pending_reboot and "1" or "0"
     elseif key == "sys_last_error" then
         return last_error
     end
@@ -217,7 +217,7 @@ function cfg.on_set(dev_key, body)
     local changed = {}          -- tag -> 新值字符串
     local fail_tags = {}
     local not_found_tags = {}
-    local need_reboot_before = need_reboot_flag
+    local reboot_before = pending_reboot
 
     for tag, raw in pairs(body) do
         if tag ~= "mid" then
@@ -235,7 +235,7 @@ function cfg.on_set(dev_key, body)
                     if tostring(old) ~= tostring(val) then
                         changed[tag] = tostring(val)
                     end
-                    if meta.need_reboot then need_reboot_flag = true end
+                    if meta.requires_reboot then pending_reboot = true end
                     log.info("mqtt.cfg", "set 成功", tag, tostring(old) .. " -> " .. tostring(val))
                 end
 
@@ -251,8 +251,8 @@ function cfg.on_set(dev_key, body)
         end
     end
 
-    -- 本次写入把 need_reboot 从 0 翻到 1：作为一条状态变化一并上报
-    local reboot_flipped = (need_reboot_flag and not need_reboot_before)
+    -- 本次写入把"待重启"从 0 翻到 1：作为一条状态变化一并上报
+    local reboot_flipped = (pending_reboot and not reboot_before)
     if reboot_flipped then
         mtime["sys_need_reboot"] = now
     end
