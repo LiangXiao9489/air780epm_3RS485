@@ -85,8 +85,13 @@ local mtime = {}
 
 -- 有待重启生效的参数（重启后自然清零）
 local pending_reboot = false
--- 最近一次失败原因（readonly / invalid_value / flash_fail）
+-- 最近一次失败原因（readonly / invalid_value / flash_fail / ota_*）
 local last_error = ""
+
+-- 供外部模块（ota 等）写入失败原因
+function cfg.set_last_error(val)
+    last_error = tostring(val or "")
+end
 
 -- 参数时间：优先用写入时间；未写过或时间非法时退回当前时间
 local function param_ts(key)

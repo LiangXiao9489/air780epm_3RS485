@@ -36,6 +36,7 @@ local ack             = require "ack"
 local sender          = require "sender"
 local report          = require "report"
 local cfg             = require "cfg"
+local ota             = require "ota"
 
 local down = {}
 
@@ -286,10 +287,35 @@ local TOPIC_HANDLERS = {
         set = function(msg)
             sys.taskInit(function()
                 for dev_id, body in pairs(msg.d or {}) do
-                    if tostring(dev_id) == topics.SN then
-                        cfg.on_set(dev_id, body)
-                    else
+                    if tostring(dev_id) ~= topics.SN then
                         log.warn("mqtt.down", "cfg topic 设备号不是本机", dev_id, "sn=" .. topics.SN)
+                    elseif ota.is_busy() and body.sys_action then
+                        -- OTA 升级中拦截 reboot/factoryReset，避免把升级打断
+                        log.warn("mqtt.down", "OTA 升级中，拦截 sys_action")
+                        local mid = body.mid
+                        sender.publish(topics.UP_CFG,
+                            ack.build("setack", topics.SN, { fail = { "busy" } }, mid), 1)
+                        cfg.set_last_error("ota_busy")
+                    else
+                        cfg.on_set(dev_id, body)
+                    end
+                end
+            end)
+        end,
+
+        -- OTA 升级：{"t":"ota","d":{"${sn}":{"url":"...","crc":"...","size":"...","mid":1}}}
+        -- ack 分两阶段：otaDownloadAck（下载/校验阶段）+ otaVerifyAck（CRC 校验阶段）
+        ota = function(msg)
+            sys.taskInit(function()
+                for dev_id, body in pairs(msg.d or {}) do
+                    if tostring(dev_id) == topics.SN then
+                        ota.on_ota(body)
+                    else
+                        log.warn("mqtt.down", "ota topic 设备号不是本机", dev_id, "sn=" .. topics.SN)
+                        cfg.set_last_error("ota_param")
+                        sender.publish(topics.UP_CFG,
+                            ack.build("otaDownloadAck", topics.SN,
+                                      { fail = { "param" } }, body and body.mid), 1)
                     end
                 end
             end)
