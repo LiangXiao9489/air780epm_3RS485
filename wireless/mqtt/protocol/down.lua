@@ -35,6 +35,7 @@ local up              = require "up"
 local ack             = require "ack"
 local sender          = require "sender"
 local report          = require "report"
+local cfg             = require "cfg"
 
 local down = {}
 
@@ -264,6 +265,22 @@ local TOPIC_HANDLERS = {
 
         ctr = function(msg)
             log.info("mqtt.down", "ctr 控制", json.encode(msg.d))
+        end,
+    },
+
+    -- /s2/${sn}：网关自身参数（把网关当成一台虚拟设备，UID 作为设备 id）
+    -- 与设备 call/set 结构完全一致，只是网关内部改为读写 config 而不是 485 写穿透
+    [topics.SUB_CFG] = {
+        call = function(msg)
+            sys.taskInit(function()
+                for dev_id, body in pairs(msg.d or {}) do
+                    if tostring(dev_id) == topics.SN then
+                        cfg.on_call(dev_id, body)
+                    else
+                        log.warn("mqtt.down", "cfg topic 设备号不是本机", dev_id, "sn=" .. topics.SN)
+                    end
+                end
+            end)
         end,
     },
 }
